@@ -1,4 +1,7 @@
-//! # tsp-ltv
+//! # ritsp-ltv
+//!
+//! Rhein Industries' maintained fork of
+//! [tsp-ltv](https://github.com/kushaldas/tsp-ltv) by Kushal Das.
 //!
 //! Shared timestamping (RFC 3161) and long-term validation infrastructure
 //! for Advanced Electronic Signature (AdES) formats.

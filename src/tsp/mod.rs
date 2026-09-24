@@ -13,9 +13,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use tsp_ltv::tsp::{TsaClient, TsaClientPool};
+//! use ritsp_ltv::tsp::{TsaClient, TsaClientPool};
 //!
-//! # async fn example() -> Result<(), tsp_ltv::error::TspError> {
+//! # async fn example() -> Result<(), ritsp_ltv::error::TspError> {
 //! // Single TSA
 //! let client = TsaClient::new("http://timestamp.digicert.com")?;
 //! let hash = vec![0u8; 32]; // SHA-256 hash of signature value

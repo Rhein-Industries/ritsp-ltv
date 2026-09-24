@@ -1,12 +1,20 @@
 [package]
-name = "tsp-ltv"
-version = "0.4.0"
+name = "ritsp-ltv"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Shared timestamping (RFC 3161) and long-term validation (OCSP, CRL, trust stores) infrastructure for AdES signatures"
+# ritsp-ltv is Rhein Industries' maintained fork of tsp-ltv by Kushal Das
+# (https://github.com/kushaldas/tsp-ltv); see README.md and LICENSE.
+authors = ["Kushal Das (original tsp-ltv author)", "Rhein Industries"]
+description = "Maintained fork of tsp-ltv: shared timestamping (RFC 3161) and long-term validation (OCSP, CRL, trust stores) infrastructure for AdES signatures, on riptering"
 license = "BSD-2-Clause"
+repository = "https://github.com/Rhein-Industries/ritsp-ltv"
+homepage = "https://github.com/Rhein-Industries/ritsp-ltv"
+documentation = "https://docs.rs/ritsp-ltv"
+readme = "README.md"
 keywords = ["tsp", "ocsp", "crl", "x509", "digital-signature"]
 categories = ["cryptography"]
+exclude = [".github/", ".cargo/", ".gitignore"]
 
 [features]
 default = [

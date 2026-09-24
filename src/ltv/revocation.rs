@@ -23,9 +23,9 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use tsp_ltv::ltv::revocation::{RevocationConfig, check_certificate_revocation};
-//! use tsp_ltv::ltv::{OcspClient, CrlClient};
-//! # async fn example() -> Result<(), tsp_ltv::error::LtvError> {
+//! use ritsp_ltv::ltv::revocation::{RevocationConfig, check_certificate_revocation};
+//! use ritsp_ltv::ltv::{OcspClient, CrlClient};
+//! # async fn example() -> Result<(), ritsp_ltv::error::LtvError> {
 //! let config = RevocationConfig::default();
 //! let ocsp = OcspClient::new()?;
 //! let crl = CrlClient::new()?;
@@ -63,7 +63,7 @@ use crate::ltv::status::{resolve_priority, ValidationStatus};
 /// methods, e.g.
 ///
 /// ```rust
-/// # use tsp_ltv::ltv::revocation::RevocationConfig;
+/// # use ritsp_ltv::ltv::revocation::RevocationConfig;
 /// let config = RevocationConfig {
 ///     require_revocation_check: false,
 ///     ..RevocationConfig::default()

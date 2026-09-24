@@ -298,7 +298,7 @@ impl std::fmt::Display for SignatureAlgorithm {
 /// # Example
 ///
 /// ```
-/// use tsp_ltv::crypto::algorithm::{AlgorithmRegistry, DigestAlgorithm, SignatureAlgorithm};
+/// use ritsp_ltv::crypto::algorithm::{AlgorithmRegistry, DigestAlgorithm, SignatureAlgorithm};
 ///
 /// // Allow only SHA-256/384/512 with RSA and ECDSA (no SHA-3, no Ed25519)
 /// let registry = AlgorithmRegistry::new()
@@ -411,14 +411,12 @@ impl AlgorithmRegistry {
     ) -> Result<(), String> {
         if !self.is_signature_allowed(sig_alg) {
             return Err(format!(
-                "signature algorithm {} is not allowed by the algorithm registry",
-                sig_alg
+                "signature algorithm {sig_alg} is not allowed by the algorithm registry"
             ));
         }
         if !self.is_digest_allowed(digest_alg) {
             return Err(format!(
-                "digest algorithm {} is not allowed by the algorithm registry",
-                digest_alg
+                "digest algorithm {digest_alg} is not allowed by the algorithm registry"
             ));
         }
         Ok(())

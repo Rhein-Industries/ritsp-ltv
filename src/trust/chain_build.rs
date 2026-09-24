@@ -188,7 +188,7 @@ mod tests {
         let issuer_signer = SigningKey::<Sha256>::new(issuer_key.clone());
         let issuer_spki =
             SubjectPublicKeyInfoOwned::from_key(issuer_signer.verifying_key()).unwrap();
-        let issuer_name: Name = "CN=Legacy Issuer,O=tsp-ltv tests".parse().unwrap();
+        let issuer_name: Name = "CN=Legacy Issuer,O=ritsp-ltv tests".parse().unwrap();
         let issuer = CertificateBuilder::new(
             Profile::Root,
             SerialNumber::new(&[0x01]).unwrap(),
@@ -208,7 +208,7 @@ mod tests {
             SigningKey::<Sha256>::new(leaf_key).verifying_key(),
         )
         .unwrap();
-        let leaf_subject: Name = "CN=Legacy Leaf,O=tsp-ltv tests".parse().unwrap();
+        let leaf_subject: Name = "CN=Legacy Leaf,O=ritsp-ltv tests".parse().unwrap();
         let base = CertificateBuilder::new(
             Profile::Leaf {
                 issuer: issuer.tbs_certificate.subject.clone(),

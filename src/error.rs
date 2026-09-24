@@ -1,4 +1,4 @@
-//! Error types for the tsp-ltv crate.
+//! Error types for the ritsp-ltv crate.
 
 use thiserror::Error;
 

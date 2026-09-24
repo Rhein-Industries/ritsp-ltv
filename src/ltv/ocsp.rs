@@ -1690,8 +1690,7 @@ pub fn check_revocation_detailed(
             // Time-aware: if revocationTime > validation_time → Valid
             if *revocation_time > now {
                 log::debug!(
-                    "cert found revoked in OCSP but revocation_time ({}) is after validation_time ({})",
-                    revocation_time, now
+                    "cert found revoked in OCSP but revocation_time ({revocation_time}) is after validation_time ({now})"
                 );
                 ValidationStatus::Valid {
                     source: RevocationSource::Ocsp,

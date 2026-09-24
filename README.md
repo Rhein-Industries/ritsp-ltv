@@ -1,4 +1,16 @@
-# tsp-ltv
+# ritsp-ltv
+
+> **Fork notice.** ritsp-ltv is Rhein Industries' actively maintained fork of
+> [tsp-ltv](https://github.com/kushaldas/tsp-ltv) by Kushal Das. It starts
+> from tsp-ltv 0.4.0 and keeps tsp-ltv's BSD-2-Clause license and copyright
+> notice. ritsp-ltv is **not affiliated with or endorsed by** the upstream
+> author: please report problems with ritsp-ltv to Rhein Industries, not to
+> the tsp-ltv project.
+>
+> - Bugs and feature requests:
+>   <https://github.com/Rhein-Industries/ritsp-ltv/issues>
+> - Security problems: report them privately as described in
+>   [SECURITY.md](SECURITY.md); do not open a public issue.
 
 Shared timestamping (RFC 3161) and long-term validation infrastructure for
 Advanced Electronic Signature (AdES) formats. Provides OCSP, CRL, trust
@@ -6,7 +18,7 @@ stores, and certificate chain building used by
 [underskrift](https://github.com/kushaldas/underskrift) (PAdES/CAdES),
 bergshamra (XAdES), and jades (JAdES).
 
-Version 0.4 requires Rust 1.88 and delegates all cryptographic operations and
+Version 0.5 requires Rust 1.88 and delegates all cryptographic operations and
 TLS provider configuration to `riptering` 0.6, Rhein Industries' maintained fork
 of `kryptering`.
 

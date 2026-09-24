@@ -37,9 +37,9 @@ impl std::fmt::Display for StoreKind {
 /// # Example
 ///
 /// ```no_run
-/// use tsp_ltv::trust::{TrustStore, TrustStoreSet};
+/// use ritsp_ltv::trust::{TrustStore, TrustStoreSet};
 ///
-/// # fn example() -> Result<(), tsp_ltv::error::TrustError> {
+/// # fn example() -> Result<(), ritsp_ltv::error::TrustError> {
 /// let stores = TrustStoreSet::new()
 ///     .with_sig_store(TrustStore::from_pem_file("ca-bundle.pem")?)
 ///     .with_tsa_store(TrustStore::from_pem_file("tsa-roots.pem")?);

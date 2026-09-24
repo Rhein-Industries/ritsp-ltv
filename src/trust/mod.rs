@@ -16,9 +16,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use tsp_ltv::trust::{TrustStore, TrustStoreSet};
+//! use ritsp_ltv::trust::{TrustStore, TrustStoreSet};
 //!
-//! # fn example() -> Result<(), tsp_ltv::error::TrustError> {
+//! # fn example() -> Result<(), ritsp_ltv::error::TrustError> {
 //! // Load a trust store from a PEM file
 //! let sig_store = TrustStore::from_pem_file("ca-certs.pem")?;
 //!

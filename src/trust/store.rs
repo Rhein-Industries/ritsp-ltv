@@ -987,7 +987,7 @@ mod tests {
         let serial = SerialNumber::new(&[0x01]).unwrap();
         let validity =
             Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
-        let subject: Name = "CN=Legacy SHA-1 Root,O=tsp-ltv tests".parse().unwrap();
+        let subject: Name = "CN=Legacy SHA-1 Root,O=ritsp-ltv tests".parse().unwrap();
         let base = CertificateBuilder::new(Profile::Root, serial, validity, subject, spki, &signer)
             .expect("cert builder")
             .build()
@@ -1104,9 +1104,9 @@ mod tests {
         let root_signer = SigningKey::<Sha256>::new(root_key.clone());
         let mid_signer = SigningKey::<Sha256>::new(mid_key.clone());
 
-        let root_name = "CN=PathLen Root,O=tsp-ltv tests";
-        let mid_name = "CN=PathLen Mid,O=tsp-ltv tests";
-        let leaf_name = "CN=PathLen Leaf CA,O=tsp-ltv tests";
+        let root_name = "CN=PathLen Root,O=ritsp-ltv tests";
+        let mid_name = "CN=PathLen Mid,O=ritsp-ltv tests";
+        let leaf_name = "CN=PathLen Leaf CA,O=ritsp-ltv tests";
         let root_issuer: Name = root_name.parse().unwrap();
         let mid_issuer: Name = mid_name.parse().unwrap();
 
@@ -1179,9 +1179,9 @@ mod tests {
         let root_signer = SigningKey::<Sha256>::new(root_key.clone());
         let mid_signer = SigningKey::<Sha256>::new(mid_key.clone());
 
-        let root_name = "CN=Anchor Root,O=tsp-ltv tests";
-        let mid_name = "CN=Anchor Mid,O=tsp-ltv tests";
-        let leaf_name = "CN=Anchor Leaf CA,O=tsp-ltv tests";
+        let root_name = "CN=Anchor Root,O=ritsp-ltv tests";
+        let mid_name = "CN=Anchor Mid,O=ritsp-ltv tests";
+        let leaf_name = "CN=Anchor Leaf CA,O=ritsp-ltv tests";
         let root_issuer: Name = root_name.parse().unwrap();
         let mid_issuer: Name = mid_name.parse().unwrap();
 
@@ -1259,7 +1259,7 @@ mod tests {
 
         let root_signer = SigningKey::<Sha256>::new(root_key.clone());
 
-        let root_name = "CN=Rollover Root,O=tsp-ltv tests";
+        let root_name = "CN=Rollover Root,O=ritsp-ltv tests";
         let root_issuer: Name = root_name.parse().unwrap();
 
         let root = issue_cert(
@@ -1344,9 +1344,9 @@ mod tests {
         let root_signer = SigningKey::<Sha256>::new(root_key.clone());
         let mid_signer = SigningKey::<Sha256>::new(mid_key.clone());
 
-        let root_name = "CN=NonCA Root,O=tsp-ltv tests";
-        let mid_name = "CN=NonCA Mid,O=tsp-ltv tests";
-        let leaf_name = "CN=NonCA Leaf,O=tsp-ltv tests";
+        let root_name = "CN=NonCA Root,O=ritsp-ltv tests";
+        let mid_name = "CN=NonCA Mid,O=ritsp-ltv tests";
+        let leaf_name = "CN=NonCA Leaf,O=ritsp-ltv tests";
         let root_issuer: Name = root_name.parse().unwrap();
         let mid_issuer: Name = mid_name.parse().unwrap();
 
@@ -1402,8 +1402,8 @@ mod tests {
         let leaf_key = RsaPrivateKey::new(&mut rng, 2048).expect("leaf key");
         let root_signer = SigningKey::<Sha256>::new(root_key.clone());
 
-        let root_name = "CN=NonCA Anchor,O=tsp-ltv tests";
-        let leaf_name = "CN=NonCA Anchor Leaf,O=tsp-ltv tests";
+        let root_name = "CN=NonCA Anchor,O=ritsp-ltv tests";
+        let leaf_name = "CN=NonCA Anchor Leaf,O=ritsp-ltv tests";
         let root_issuer: Name = root_name.parse().unwrap();
 
         let root = issue_cert(
@@ -1491,7 +1491,7 @@ mod tests {
         let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
         // OID 1.2.3.4.5 is not an extension we process. Mark it critical.
         let root = root_with_extensions(
-            "CN=Critical Ext Root,O=tsp-ltv tests",
+            "CN=Critical Ext Root,O=ritsp-ltv tests",
             &key,
             vec![ext("1.2.3.4.5", true, &[0x05, 0x00])],
         );
@@ -1516,7 +1516,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
         let root = root_with_extensions(
-            "CN=NonCritical Ext Root,O=tsp-ltv tests",
+            "CN=NonCritical Ext Root,O=ritsp-ltv tests",
             &key,
             vec![ext("1.2.3.4.5", false, &[0x05, 0x00])],
         );
@@ -1543,7 +1543,7 @@ mod tests {
 
         // 2.5.29.17 subjectAltName, marked critical -> rejected without ltv.
         let san_root = root_with_extensions(
-            "CN=Critical SAN Root,O=tsp-ltv tests",
+            "CN=Critical SAN Root,O=ritsp-ltv tests",
             &key,
             // Minimal GeneralNames SEQUENCE; value is irrelevant to the
             // critical-OID check.
@@ -1561,7 +1561,7 @@ mod tests {
 
         // 2.5.29.37 extendedKeyUsage, marked critical -> still accepted.
         let eku_root = root_with_extensions(
-            "CN=Critical EKU Root,O=tsp-ltv tests",
+            "CN=Critical EKU Root,O=ritsp-ltv tests",
             &key,
             vec![ext("2.5.29.37", true, &[0x30, 0x00])],
         );
@@ -1588,13 +1588,13 @@ mod tests {
 
         let root = issue_cert(
             Profile::Root,
-            "CN=Purpose Root,O=tsp-ltv tests",
+            "CN=Purpose Root,O=ritsp-ltv tests",
             &root_key,
             &root_signer,
         );
         let leaf = issue_cert(
             leaf_profile,
-            "CN=Purpose Leaf,O=tsp-ltv tests",
+            "CN=Purpose Leaf,O=ritsp-ltv tests",
             &leaf_key,
             &root_signer,
         );
@@ -1611,7 +1611,7 @@ mod tests {
         use x509_cert::builder::Profile;
         use x509_cert::name::Name;
 
-        let root_issuer: Name = "CN=Purpose Root,O=tsp-ltv tests".parse().unwrap();
+        let root_issuer: Name = "CN=Purpose Root,O=ritsp-ltv tests".parse().unwrap();
         // A plain TLS-style end-entity leaf (digitalSignature, no OCSPSigning EKU).
         let (store, chain) = leaf_and_root(Profile::Leaf {
             issuer: root_issuer,
@@ -1642,7 +1642,7 @@ mod tests {
         use x509_cert::builder::Profile;
         use x509_cert::name::Name;
 
-        let root_issuer: Name = "CN=Purpose Root,O=tsp-ltv tests".parse().unwrap();
+        let root_issuer: Name = "CN=Purpose Root,O=ritsp-ltv tests".parse().unwrap();
         let (store, chain) = leaf_and_root(Profile::Leaf {
             issuer: root_issuer,
             enable_key_agreement: false,
@@ -1683,13 +1683,13 @@ mod tests {
         let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
         let root_signer = SigningKey::<Sha256>::new(root_key.clone());
 
-        let root_name = "CN=TSA Purpose Root,O=tsp-ltv tests";
+        let root_name = "CN=TSA Purpose Root,O=ritsp-ltv tests";
         let root = issue_cert(Profile::Root, root_name, &root_key, &root_signer);
 
         let leaf_signer = SigningKey::<Sha256>::new(leaf_key.clone());
         let spki = SubjectPublicKeyInfoOwned::from_key(leaf_signer.verifying_key()).expect("SPKI");
         let issuer: Name = root_name.parse().unwrap();
-        let subject: Name = "CN=TSA Purpose Leaf,O=tsp-ltv tests".parse().unwrap();
+        let subject: Name = "CN=TSA Purpose Leaf,O=ritsp-ltv tests".parse().unwrap();
         let validity =
             Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
         let mut builder = CertificateBuilder::new(
@@ -1766,7 +1766,7 @@ mod tests {
         // Root with a critical nameConstraints extension.
         let nc_value = name_constraints_dns(constraint_dns, excluded);
         let root = root_with_extensions(
-            "CN=NC Root,O=tsp-ltv tests",
+            "CN=NC Root,O=ritsp-ltv tests",
             &root_key,
             vec![ext("2.5.29.30", true, &nc_value)],
         );
@@ -1779,7 +1779,7 @@ mod tests {
                 enable_key_agreement: false,
                 enable_key_encipherment: false,
             },
-            "CN=NC Leaf,O=tsp-ltv tests",
+            "CN=NC Leaf,O=ritsp-ltv tests",
             &leaf_key,
             &root_signer,
         );
@@ -1871,7 +1871,7 @@ mod tests {
         let nc_value = encode_sequence_raw(&subtrees);
 
         let root = root_with_extensions(
-            "CN=NC Unsupported Root,O=tsp-ltv tests",
+            "CN=NC Unsupported Root,O=ritsp-ltv tests",
             &root_key,
             vec![ext("2.5.29.30", true, &nc_value)],
         );
@@ -1885,7 +1885,7 @@ mod tests {
                 enable_key_agreement: false,
                 enable_key_encipherment: false,
             },
-            "CN=NC Unsupported Leaf,O=tsp-ltv tests",
+            "CN=NC Unsupported Leaf,O=ritsp-ltv tests",
             &leaf_key,
             &root_signer,
         );

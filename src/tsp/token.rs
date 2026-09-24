@@ -1667,7 +1667,7 @@ mod tests {
             // Valid from "now" for ~10 years; clock-derived genTimes fall inside.
             let validity =
                 Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
-            let subject: Name = "CN=Runtime Test TSA,O=tsp-ltv tests".parse().unwrap();
+            let subject: Name = "CN=Runtime Test TSA,O=ritsp-ltv tests".parse().unwrap();
 
             let mut builder =
                 CertificateBuilder::new(profile, serial, validity, subject, spki, &ca_signer)
@@ -2093,7 +2093,7 @@ mod tests {
         let ca_key = RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
         let ca_signing = SigningKey::<Sha256>::new(ca_key.clone());
         let spki = SubjectPublicKeyInfoOwned::from_key(ca_signing.verifying_key()).expect("SPKI");
-        let subject: Name = "CN=Rogue CA TSA,O=tsp-ltv tests".parse().unwrap();
+        let subject: Name = "CN=Rogue CA TSA,O=ritsp-ltv tests".parse().unwrap();
         let validity =
             Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
         // Profile::Root emits basicConstraints cA:TRUE and self-signs.
@@ -2429,7 +2429,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let validity =
             Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
-        let issuer_name: Name = "CN=Ambiguous Issuer,O=tsp-ltv tests".parse().unwrap();
+        let issuer_name: Name = "CN=Ambiguous Issuer,O=ritsp-ltv tests".parse().unwrap();
 
         let self_signed = |name: &Name, key: &RsaPrivateKey, serial: u8| {
             let signer = SigningKey::<Sha256>::new(key.clone());
@@ -2468,7 +2468,7 @@ mod tests {
             },
             SerialNumber::new(&[0x03]).unwrap(),
             validity,
-            "CN=Ambiguous Leaf,O=tsp-ltv tests".parse().unwrap(),
+            "CN=Ambiguous Leaf,O=ritsp-ltv tests".parse().unwrap(),
             leaf_spki,
             &real_signer,
         )

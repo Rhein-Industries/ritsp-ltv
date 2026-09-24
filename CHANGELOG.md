@@ -1,8 +1,22 @@
 # Changelog
 
-## 0.4.0 [2026-07-30]
+## 0.5.0 — first ritsp-ltv release
 
-### Added
+Not yet published to crates.io. Changes relative to tsp-ltv 0.4.0:
+
+- **Renamed** to `ritsp-ltv` (`use ritsp_ltv::...`), Rhein Industries'
+  maintained fork of tsp-ltv.
+- **Breaking:** depends on [riptering](https://github.com/Rhein-Industries/riptering)
+  0.6 instead of kryptering 0.5, so errors, keys and provider types come from
+  riptering. riptering adds provider parity, FIPS and PKCS#11 hardening and a
+  bounded RSA-PSS salt length (tsp-ltv passes signature-supplied salt lengths).
+- CI runs on GitHub-hosted runners; publishing is manual for now.
+
+## tsp-ltv history (upstream, up to 0.4.0)
+
+### 0.4.0 [2026-07-30]
+
+#### Added
 
 - Forwarded RustCrypto and AWS-LC document providers plus independent ring and
   AWS-LC TLS providers from Kryptering 0.5. FIPS mode selects AWS-LC
@@ -21,7 +35,7 @@
   independently in the always-compiled CMS verification path, so `tsp`-only
   and `ltv` builds reject the same certificates.
 
-### Security
+#### Security
 
 - The delegated-OCSP-responder revocation sub-check (RFC 6960 §4.2.2.2.1) now
   inherits `require_revocation_check`: under the strict default, a delegated
@@ -47,7 +61,7 @@
 - All 23 findings of the security audit (`SECURITY_AUDIT_REPORT.md`) are now
   resolved and re-verified against this tree.
 
-### Changed
+#### Changed
 
 - **Breaking:** all digesting, randomness, nonce generation, and certificate,
   OCSP, CRL, and timestamp signature verification now use Kryptering.
@@ -59,9 +73,9 @@
   `legacy-algorithms` pin the fail-closed `UnsupportedAlgorithm` behaviour, so
   every provider/feature combination passes without losing DSA coverage.
 
-## 0.3.1 [2026-07-01]
+### 0.3.1 [2026-07-01]
 
-### Added
+#### Added
 
 - DSA (DSS) certificate/CRL/OCSP signature verification: `dsaWithSHA1`
   (`1.2.840.10040.4.3`, legacy) and `dsa-with-SHA256` (`2.16.840.1.101.3.4.3.2`).
@@ -71,15 +85,15 @@
   the existing SHA-1/MD5 handling.
 
 
-## 0.3.0 [2026-06-27]
+### 0.3.0 [2026-06-27]
 
 Chain-validation hardening: AIA SSRF guard, critical-extension rejection, leaf
 purpose binding, RFC 5280 name constraints, delegated-OCSP-responder checking,
 and fail-closed trust-anchor loading. See `docs/adr/0015-chain-validation-hardening.md`.
 
-### Breaking Changes
+#### Breaking Changes
 
-#### `from_pem_directory` now fails closed on a malformed anchor
+##### `from_pem_directory` now fails closed on a malformed anchor
 
 `TrustStore::from_pem_directory` previously did a best-effort load, silently
 skipping any file it could not read or parse — which shrinks the trust-anchor
@@ -89,7 +103,7 @@ offending file. Callers that want the old best-effort behaviour must switch to
 the new `from_pem_directory_lenient`, which returns `(store, skipped)` and
 reports — never silently drops — the skipped files.
 
-#### New `TrustError::ProfileViolation` variant
+##### New `TrustError::ProfileViolation` variant
 
 RFC 5280 certificate-profile / path-validation failures — `basicConstraints` /
 `keyUsage`, `pathLenConstraint`, an unrecognized critical extension, a name
@@ -100,9 +114,9 @@ cryptographic signature failures still return `SignatureVerification`. Code that
 matched `SignatureVerification` for these profile checks — or that matches
 `TrustError` exhaustively — must be updated.
 
-### Added
+#### Added
 
-#### Shared SSRF guard (`crate::net`)
+##### Shared SSRF guard (`crate::net`)
 
 The SSRF controls originally embedded in the CRL fetch path are extracted into a
 new `net` module so the CRL and AIA paths share one audited implementation:
@@ -114,13 +128,13 @@ new `net` module so the CRL and AIA paths share one audited implementation:
   that refuses redirects to literal non-public addresses.
 - `is_disallowed_ip` — the address classifier shared by both.
 
-#### AIA chain-builder SSRF guard
+##### AIA chain-builder SSRF guard
 
 `ChainBuilder::fetch_certificate` now validates each attacker-influenced
 `caIssuers` URL through `crate::net` before egress and caps the response body at
 1 MiB, matching the CRL fetch path.
 
-#### Critical-extension rejection (RFC 5280 §4.2)
+##### Critical-extension rejection (RFC 5280 §4.2)
 
 `verify_chain` now rejects any certificate (leaf, intermediate, or anchor) that
 asserts a *critical* extension whose OID it cannot process. Extensions processed
@@ -128,14 +142,14 @@ only under the `ltv` feature (`subjectAltName`, `cRLDistributionPoints`,
 `authorityInfoAccess`, `nameConstraints`) are recognised only in that build, so a
 tsp-only build keeps such a critical extension fail-closed.
 
-#### Leaf purpose binding
+##### Leaf purpose binding
 
 `TrustStore::verify_chain_for_purpose(chain, time, purpose: CertRole)` binds the
 leaf to its expected role (EKU / keyUsage), closing a purpose-confusion
 fail-open. The existing `verify_chain` signature is unchanged (it delegates with
 no leaf purpose), so external callers are unaffected.
 
-#### RFC 5280 name constraints (`ltv::name_constraints`)
+##### RFC 5280 name constraints (`ltv::name_constraints`)
 
 A processor for `NameConstraints` (`2.5.29.30`) covering the common GeneralName
 types — dNSName, rfc822Name, iPAddress (CIDR), and directoryName (RDN-prefix) —
@@ -143,7 +157,7 @@ enforcing permitted/excluded subtrees accumulated top-down from the anchor. A
 constraint over an unsupported GeneralName type is rejected as unsupported —
 fail closed, never silently ignored.
 
-#### OCSP delegated-responder hardening
+##### OCSP delegated-responder hardening
 
 `validate_responder_trust` binds the responder certificate to the response's
 `responderID` (byName subject / byKeyHash SHA-1). The new
@@ -152,14 +166,14 @@ that lacks `id-pkix-ocsp-nocheck`; the orchestrator then checks that responder's
 own revocation status (bounded by `max_ocsp_recursion`) and fails closed if it
 is revoked or cannot be confirmed unrevoked.
 
-#### Trust-anchor directory loading
+##### Trust-anchor directory loading
 
 - `from_pem_directory_lenient` returns `(store, skipped)` for explicit
   best-effort loading, reporting the skipped files and reasons.
 - Both directory loaders accept PEM (one or more certificates) **or** a single
   DER-encoded certificate, since `.crt`/`.cer` anchors are commonly raw DER.
 
-### Changed
+#### Changed
 
 - The IPv4 SSRF deny-list mirrors `Ipv4Addr::is_global` (which is still
   nightly-only) instead of a hand-maintained subset, adding the previously
@@ -173,7 +187,7 @@ is revoked or cannot be confirmed unrevoked.
   OCSP/CRL/TSA path now reads "URL rejected: …" rather than "OCSP error:
   OCSP …"), and the non-public-address wording is no longer duplicated.
 
-### Fixed
+#### Fixed
 
 - `GeneralSubtree.minimum`/`maximum` are now enforced (RFC 5280 §4.2.1.10
   requires `minimum` to be 0 and `maximum` absent); a constraint encoding a
@@ -187,7 +201,7 @@ is revoked or cannot be confirmed unrevoked.
   the path and `ErrorKind`) rather than `CertificateParse`, and re-wrapped parse
   errors are no longer double-prefixed.
 
-## 0.2.0
+### 0.2.0
 
 Initial release: RFC 3161 timestamping client (`tsp`) and long-term validation
 (`ltv`) — OCSP/CRL/chain building — over the RustCrypto `cms` / `x509-cert`
