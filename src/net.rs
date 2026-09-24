@@ -39,7 +39,7 @@ use reqwest::Client;
 #[derive(Debug, thiserror::Error)]
 pub enum HttpClientError {
     #[error(transparent)]
-    Crypto(#[from] kryptering::Error),
+    Crypto(#[from] riptering::Error),
     #[error("failed to build hardened HTTP client: {0}")]
     Build(#[from] reqwest::Error),
 }
@@ -52,7 +52,7 @@ pub enum HttpClientError {
 #[derive(Clone)]
 pub struct AttestedHttpClient {
     inner: Client,
-    backend: kryptering::BackendInfo,
+    backend: riptering::BackendInfo,
     verified: bool,
 }
 
@@ -68,11 +68,11 @@ impl std::fmt::Debug for AttestedHttpClient {
 impl AttestedHttpClient {
     /// Provider state attested when the client was constructed.
     #[must_use]
-    pub fn backend_info(&self) -> &kryptering::BackendInfo {
+    pub fn backend_info(&self) -> &riptering::BackendInfo {
         &self.backend
     }
 
-    /// Whether this client was constructed from Kryptering's selected TLS provider.
+    /// Whether this client was constructed from riptering's selected TLS provider.
     #[must_use]
     pub const fn is_verified(&self) -> bool {
         self.verified
@@ -152,13 +152,13 @@ fn unbracket(host: &str) -> &str {
 /// than degrading to reqwest's default TLS or redirect behavior.
 pub fn hardened_http_client() -> Result<AttestedHttpClient, HttpClientError> {
     let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls = kryptering::build_tls_client_config(roots)?;
+    let tls = riptering::build_tls_client_config(roots)?;
     attested_http_client(tls)
 }
 
-/// Build a hardened HTTP client from a Kryptering-attested TLS configuration.
+/// Build a hardened HTTP client from a riptering-attested TLS configuration.
 pub fn attested_http_client(
-    tls: kryptering::AttestedTlsConfig,
+    tls: riptering::AttestedTlsConfig,
 ) -> Result<AttestedHttpClient, HttpClientError> {
     let policy = reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= MAX_REDIRECTS {
@@ -182,7 +182,7 @@ pub fn attested_http_client(
         .map_err(HttpClientError::Build)?;
     Ok(AttestedHttpClient {
         inner,
-        backend: kryptering::backend_info()?,
+        backend: riptering::backend_info()?,
         verified: true,
     })
 }
@@ -195,7 +195,7 @@ pub fn attested_http_client(
 pub fn unverified_http_client(client: Client) -> Result<AttestedHttpClient, HttpClientError> {
     Ok(AttestedHttpClient {
         inner: client,
-        backend: kryptering::backend_info()?,
+        backend: riptering::backend_info()?,
         verified: false,
     })
 }
@@ -349,13 +349,13 @@ mod tests {
 
     fn attested_client_with_root(root: Option<CertificateDer<'static>>) -> AttestedHttpClient {
         #[cfg(feature = "fips")]
-        kryptering::initialize_backend().expect("initialize FIPS backend for HTTPS unit test");
+        riptering::initialize_backend().expect("initialize FIPS backend for HTTPS unit test");
 
         let mut roots = rustls::RootCertStore::empty();
         if let Some(root) = root {
             roots.add(root).expect("add test trust anchor");
         }
-        let tls = kryptering::build_tls_client_config(roots).expect("attested test TLS config");
+        let tls = riptering::build_tls_client_config(roots).expect("attested test TLS config");
         attested_http_client(tls).expect("attested test HTTP client")
     }
 

@@ -1335,8 +1335,8 @@ fn digest_algorithm_identifier(alg: DigestAlgorithm) -> AlgorithmIdentifierOwned
 // ---------------------------------------------------------------------------
 
 /// Generate a cryptographically random 64-bit nonce for timestamp requests.
-pub fn generate_nonce() -> kryptering::Result<u64> {
-    let buf = kryptering::random_bytes(8)?;
+pub fn generate_nonce() -> riptering::Result<u64> {
+    let buf = riptering::random_bytes(8)?;
     Ok(u64::from_ne_bytes(
         buf.try_into()
             .expect("requested exactly eight random bytes"),

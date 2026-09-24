@@ -541,7 +541,7 @@ fn build_cert_id(cert: &Certificate, issuer: &Certificate) -> Result<Vec<u8>, Lt
 
 /// Generate a cryptographically random nonce of NONCE_SIZE bytes.
 fn generate_nonce() -> Result<Vec<u8>, LtvError> {
-    Ok(kryptering::random_bytes(NONCE_SIZE)?)
+    Ok(riptering::random_bytes(NONCE_SIZE)?)
 }
 
 /// Build SHA-1 AlgorithmIdentifier (SEQUENCE { OID, NULL }).
@@ -1718,8 +1718,8 @@ pub fn check_revocation_detailed(
 
 /// Compute SHA-1 hash of data.
 fn sha1_hash(data: &[u8]) -> Result<Vec<u8>, LtvError> {
-    Ok(kryptering::digest::digest(
-        kryptering::HashAlgorithm::Sha1,
+    Ok(riptering::digest::digest(
+        riptering::HashAlgorithm::Sha1,
         data,
     )?)
 }

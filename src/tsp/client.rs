@@ -116,7 +116,7 @@ impl TsaClient {
         self
     }
 
-    /// Set a custom HTTP client carrying Kryptering provider attestation.
+    /// Set a custom HTTP client carrying riptering provider attestation.
     pub fn http_client(mut self, client: AttestedHttpClient) -> Self {
         self.http_client = client;
         self

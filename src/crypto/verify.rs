@@ -143,25 +143,25 @@ fn verify_ecdsa_bound(
     let curve = ec_named_curve(&spki)?;
     let (curve, hash) = match (curve, hash) {
         (EcCurve::P256, EcdsaHash::Sha256) => {
-            (kryptering::EcCurve::P256, kryptering::HashAlgorithm::Sha256)
+            (riptering::EcCurve::P256, riptering::HashAlgorithm::Sha256)
         }
         (EcCurve::P384, EcdsaHash::Sha384) => {
-            (kryptering::EcCurve::P384, kryptering::HashAlgorithm::Sha384)
+            (riptering::EcCurve::P384, riptering::HashAlgorithm::Sha384)
         }
         (EcCurve::P521, EcdsaHash::Sha512) => {
-            (kryptering::EcCurve::P521, kryptering::HashAlgorithm::Sha512)
+            (riptering::EcCurve::P521, riptering::HashAlgorithm::Sha512)
         }
         (EcCurve::P521, EcdsaHash::Sha256) => {
-            (kryptering::EcCurve::P521, kryptering::HashAlgorithm::Sha256)
+            (riptering::EcCurve::P521, riptering::HashAlgorithm::Sha256)
         }
         (EcCurve::P521, EcdsaHash::Sha384) => {
-            (kryptering::EcCurve::P521, kryptering::HashAlgorithm::Sha384)
+            (riptering::EcCurve::P521, riptering::HashAlgorithm::Sha384)
         }
         (EcCurve::P256, EcdsaHash::Sha1) => {
-            (kryptering::EcCurve::P256, kryptering::HashAlgorithm::Sha1)
+            (riptering::EcCurve::P256, riptering::HashAlgorithm::Sha1)
         }
         (EcCurve::P384, EcdsaHash::Sha1) => {
-            (kryptering::EcCurve::P384, kryptering::HashAlgorithm::Sha1)
+            (riptering::EcCurve::P384, riptering::HashAlgorithm::Sha1)
         }
         (curve, hash) => {
             return Err(TrustError::SignatureVerification(format!(
@@ -173,15 +173,15 @@ fn verify_ecdsa_bound(
         tbs,
         sig,
         spki_der,
-        kryptering::KeyAlgorithm::Ec(curve),
-        kryptering::SignatureAlgorithm::Ecdsa(curve, hash),
+        riptering::KeyAlgorithm::Ec(curve),
+        riptering::SignatureAlgorithm::Ecdsa(curve, hash),
         None,
     )
 }
 
-fn map_backend_error(error: kryptering::Error) -> TrustError {
+fn map_backend_error(error: riptering::Error) -> TrustError {
     match error {
-        kryptering::Error::UnsupportedAlgorithm { .. } => {
+        riptering::Error::UnsupportedAlgorithm { .. } => {
             TrustError::UnsupportedAlgorithm(error.to_string())
         }
         other => TrustError::SignatureVerification(other.to_string()),
@@ -194,8 +194,8 @@ fn verify_legacy_md5_rsa(tbs: &[u8], signature: &[u8], spki_der: &[u8]) -> Resul
         tbs,
         signature,
         spki_der,
-        kryptering::KeyAlgorithm::Rsa,
-        kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Md5),
+        riptering::KeyAlgorithm::Rsa,
+        riptering::SignatureAlgorithm::RsaPkcs1v15(riptering::HashAlgorithm::Md5),
         None,
     );
     #[cfg(not(feature = "legacy-algorithms"))]
@@ -211,15 +211,15 @@ fn verify_dsa(
     tbs: &[u8],
     signature: &[u8],
     spki_der: &[u8],
-    hash: kryptering::HashAlgorithm,
+    hash: riptering::HashAlgorithm,
 ) -> Result<(), TrustError> {
     #[cfg(feature = "legacy-algorithms")]
     return verify_with_backend(
         tbs,
         signature,
         spki_der,
-        kryptering::KeyAlgorithm::Dsa,
-        kryptering::SignatureAlgorithm::Dsa(hash),
+        riptering::KeyAlgorithm::Dsa,
+        riptering::SignatureAlgorithm::Dsa(hash),
         None,
     );
     #[cfg(not(feature = "legacy-algorithms"))]
@@ -235,17 +235,17 @@ fn verify_with_backend(
     tbs: &[u8],
     signature: &[u8],
     spki_der: &[u8],
-    key_algorithm: kryptering::KeyAlgorithm,
-    signature_algorithm: kryptering::SignatureAlgorithm,
+    key_algorithm: riptering::KeyAlgorithm,
+    signature_algorithm: riptering::SignatureAlgorithm,
     rsa_pss_salt_len: Option<usize>,
 ) -> Result<(), TrustError> {
-    let key = kryptering::SoftwareKey::from_spki_der(key_algorithm, spki_der)
+    let key = riptering::SoftwareKey::from_spki_der(key_algorithm, spki_der)
         .map_err(map_backend_error)?;
     let verifier = match (signature_algorithm, rsa_pss_salt_len) {
-        (kryptering::SignatureAlgorithm::RsaPss(hash), Some(salt_len)) => {
-            kryptering::SoftwareVerifier::new_rsa_pss_with_salt(hash, salt_len, key)
+        (riptering::SignatureAlgorithm::RsaPss(hash), Some(salt_len)) => {
+            riptering::SoftwareVerifier::new_rsa_pss_with_salt(hash, salt_len, key)
         }
-        _ => kryptering::SoftwareVerifier::new(signature_algorithm, key),
+        _ => riptering::SoftwareVerifier::new(signature_algorithm, key),
     }
     .map_err(map_backend_error)?;
     if verifier
@@ -392,8 +392,8 @@ pub fn verify_signature_by_oid_with_policy(
             tbs_bytes,
             signature_bytes,
             spki_der,
-            kryptering::KeyAlgorithm::Rsa,
-            kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha1),
+            riptering::KeyAlgorithm::Rsa,
+            riptering::SignatureAlgorithm::RsaPkcs1v15(riptering::HashAlgorithm::Sha1),
             None,
         )
     } else if *sig_alg_oid == OID_SHA224_WITH_RSA {
@@ -401,8 +401,8 @@ pub fn verify_signature_by_oid_with_policy(
             tbs_bytes,
             signature_bytes,
             spki_der,
-            kryptering::KeyAlgorithm::Rsa,
-            kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha224),
+            riptering::KeyAlgorithm::Rsa,
+            riptering::SignatureAlgorithm::RsaPkcs1v15(riptering::HashAlgorithm::Sha224),
             None,
         )
     }
@@ -412,8 +412,8 @@ pub fn verify_signature_by_oid_with_policy(
             tbs_bytes,
             signature_bytes,
             spki_der,
-            kryptering::KeyAlgorithm::Rsa,
-            kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha256),
+            riptering::KeyAlgorithm::Rsa,
+            riptering::SignatureAlgorithm::RsaPkcs1v15(riptering::HashAlgorithm::Sha256),
             None,
         )
     } else if *sig_alg_oid == db::rfc5912::SHA_384_WITH_RSA_ENCRYPTION {
@@ -421,8 +421,8 @@ pub fn verify_signature_by_oid_with_policy(
             tbs_bytes,
             signature_bytes,
             spki_der,
-            kryptering::KeyAlgorithm::Rsa,
-            kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha384),
+            riptering::KeyAlgorithm::Rsa,
+            riptering::SignatureAlgorithm::RsaPkcs1v15(riptering::HashAlgorithm::Sha384),
             None,
         )
     } else if *sig_alg_oid == db::rfc5912::SHA_512_WITH_RSA_ENCRYPTION {
@@ -430,17 +430,17 @@ pub fn verify_signature_by_oid_with_policy(
             tbs_bytes,
             signature_bytes,
             spki_der,
-            kryptering::KeyAlgorithm::Rsa,
-            kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha512),
+            riptering::KeyAlgorithm::Rsa,
+            riptering::SignatureAlgorithm::RsaPkcs1v15(riptering::HashAlgorithm::Sha512),
             None,
         )
     } else if *sig_alg_oid == OID_RSASSA_PSS {
         // RSA-PSS: AlgorithmIdentifier parameters should specify the hash,
         // but here we only have the OID. Try SHA-256 first, then SHA-384, SHA-512.
         [
-            kryptering::HashAlgorithm::Sha256,
-            kryptering::HashAlgorithm::Sha384,
-            kryptering::HashAlgorithm::Sha512,
+            riptering::HashAlgorithm::Sha256,
+            riptering::HashAlgorithm::Sha384,
+            riptering::HashAlgorithm::Sha512,
         ]
         .into_iter()
         .find_map(|hash| {
@@ -448,8 +448,8 @@ pub fn verify_signature_by_oid_with_policy(
                 tbs_bytes,
                 signature_bytes,
                 spki_der,
-                kryptering::KeyAlgorithm::Rsa,
-                kryptering::SignatureAlgorithm::RsaPss(hash),
+                riptering::KeyAlgorithm::Rsa,
+                riptering::SignatureAlgorithm::RsaPss(hash),
                 None,
             )
             .ok()
@@ -470,7 +470,7 @@ pub fn verify_signature_by_oid_with_policy(
             tbs_bytes,
             signature_bytes,
             spki_der,
-            kryptering::HashAlgorithm::Sha1,
+            riptering::HashAlgorithm::Sha1,
         )
     }
     // --- DSA/DSS with SHA-256 ---
@@ -479,7 +479,7 @@ pub fn verify_signature_by_oid_with_policy(
             tbs_bytes,
             signature_bytes,
             spki_der,
-            kryptering::HashAlgorithm::Sha256,
+            riptering::HashAlgorithm::Sha256,
         )
     }
     // --- Modern ECDSA — the curve is taken from the key (L-8) ---
@@ -494,8 +494,8 @@ pub fn verify_signature_by_oid_with_policy(
             tbs_bytes,
             signature_bytes,
             spki_der,
-            kryptering::KeyAlgorithm::Ed25519,
-            kryptering::SignatureAlgorithm::Ed25519,
+            riptering::KeyAlgorithm::Ed25519,
+            riptering::SignatureAlgorithm::Ed25519,
             None,
         )
     } else {
@@ -626,9 +626,9 @@ pub fn verify_rsa_pss_signature_strict(
     }
     let salt_len = params.salt_len as usize;
     let backend_hash = match hash {
-        DigestAlgorithm::Sha256 => kryptering::HashAlgorithm::Sha256,
-        DigestAlgorithm::Sha384 => kryptering::HashAlgorithm::Sha384,
-        DigestAlgorithm::Sha512 => kryptering::HashAlgorithm::Sha512,
+        DigestAlgorithm::Sha256 => riptering::HashAlgorithm::Sha256,
+        DigestAlgorithm::Sha384 => riptering::HashAlgorithm::Sha384,
+        DigestAlgorithm::Sha512 => riptering::HashAlgorithm::Sha512,
         other => {
             return Err(TrustError::UnsupportedAlgorithm(format!(
                 "RSASSA-PSS with digest {other:?}"
@@ -639,8 +639,8 @@ pub fn verify_rsa_pss_signature_strict(
         tbs,
         sig,
         spki_der,
-        kryptering::KeyAlgorithm::Rsa,
-        kryptering::SignatureAlgorithm::RsaPss(backend_hash),
+        riptering::KeyAlgorithm::Rsa,
+        riptering::SignatureAlgorithm::RsaPss(backend_hash),
         Some(salt_len),
     )?;
     Ok(hash)

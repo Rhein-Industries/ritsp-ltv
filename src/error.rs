@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum TspError {
     #[error(transparent)]
-    Crypto(#[from] kryptering::Error),
+    Crypto(#[from] riptering::Error),
 
     #[cfg(feature = "tsp")]
     #[error(transparent)]
@@ -30,7 +30,7 @@ pub enum TspError {
 #[derive(Debug, Error)]
 pub enum LtvError {
     #[error(transparent)]
-    Crypto(#[from] kryptering::Error),
+    Crypto(#[from] riptering::Error),
 
     #[error(transparent)]
     HttpClient(#[from] crate::net::HttpClientError),

@@ -26,7 +26,7 @@ compile_error!("networking requires exactly one TLS provider: tls-ring or tls-aw
 #[cfg(all(feature = "tls-ring", feature = "tls-aws-lc"))]
 compile_error!("TLS provider features are mutually exclusive: select exactly one");
 
-pub use kryptering::{
+pub use riptering::{
     backend_info, capabilities, initialize_backend, supports, BackendId, BackendInfo, Capability,
     FipsStatus, Operation, TlsBackendId,
 };

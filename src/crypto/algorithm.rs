@@ -126,16 +126,16 @@ impl DigestAlgorithm {
     }
 
     /// Compute the digest of the given data.
-    pub fn digest(&self, data: &[u8]) -> kryptering::Result<Vec<u8>> {
-        kryptering::digest::digest((*self).into(), data)
+    pub fn digest(&self, data: &[u8]) -> riptering::Result<Vec<u8>> {
+        riptering::digest::digest((*self).into(), data)
     }
 
     /// Create a streaming hasher for this algorithm.
     ///
     /// Use this when you need to hash data in multiple chunks (e.g., the two
     /// ByteRange segments for PDF signing).
-    pub fn new_hasher(&self) -> kryptering::Result<DigestHasher> {
-        kryptering::digest::new_digest((*self).into()).map(DigestHasher::new)
+    pub fn new_hasher(&self) -> riptering::Result<DigestHasher> {
+        riptering::digest::new_digest((*self).into()).map(DigestHasher::new)
     }
 
     /// Output size of the digest in bytes.
@@ -180,7 +180,7 @@ impl DigestAlgorithm {
     }
 }
 
-impl From<DigestAlgorithm> for kryptering::HashAlgorithm {
+impl From<DigestAlgorithm> for riptering::HashAlgorithm {
     fn from(value: DigestAlgorithm) -> Self {
         match value {
             DigestAlgorithm::Sha256 => Self::Sha256,
@@ -203,11 +203,11 @@ impl std::fmt::Display for DigestAlgorithm {
 
 /// Opaque provider-backed streaming hasher.
 pub struct DigestHasher {
-    inner: Box<dyn kryptering::digest::DigestStream>,
+    inner: Box<dyn riptering::digest::DigestStream>,
 }
 
 impl DigestHasher {
-    fn new(inner: Box<dyn kryptering::digest::DigestStream>) -> Self {
+    fn new(inner: Box<dyn riptering::digest::DigestStream>) -> Self {
         Self { inner }
     }
 
@@ -217,7 +217,7 @@ impl DigestHasher {
     }
 
     /// Finalize the hash and return the digest bytes.
-    pub fn finalize(self) -> kryptering::Result<Vec<u8>> {
+    pub fn finalize(self) -> riptering::Result<Vec<u8>> {
         self.inner.finalize()
     }
 }

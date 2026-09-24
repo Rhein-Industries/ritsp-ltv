@@ -19,16 +19,16 @@ default = [
 ]
 
 # Document cryptography provider (exactly one).
-rustcrypto = ["kryptering/rustcrypto"]
-aws-lc = ["kryptering/aws-lc"]
+rustcrypto = ["riptering/rustcrypto"]
+aws-lc = ["riptering/aws-lc"]
 
 # Network TLS provider (exactly one whenever `tsp` is enabled).
-tls-ring = ["kryptering/tls-ring"]
-tls-aws-lc = ["kryptering/tls-aws-lc"]
+tls-ring = ["riptering/tls-ring"]
+tls-aws-lc = ["riptering/tls-aws-lc"]
 
 # Compliance mode. Explicit backend initialization is required before use.
-fips = ["aws-lc", "kryptering/fips"]
-legacy-algorithms = ["kryptering/legacy"]
+fips = ["aws-lc", "riptering/fips"]
+legacy-algorithms = ["riptering/legacy"]
 
 # RFC 3161 timestamping (TSA client)
 tsp = [
@@ -46,7 +46,10 @@ ltv = ["tsp"]
 blocking = ["dep:tokio"]
 
 [dependencies]
-kryptering = { version = "0.5.0", default-features = false }
+# Document cryptography, randomness and TLS provider configuration.
+# riptering is Rhein Industries' maintained fork of kryptering; only the
+# features forwarded above are enabled (never `pkcs11` or `post-quantum`).
+riptering = { version = "0.6", default-features = false }
 # CMS / PKCS#7 / X.509 (RustCrypto ecosystem)
 cms = { version = "0.2", features = ["alloc"] }
 x509-cert = { version = "0.2", features = ["pem"] }
@@ -77,7 +80,9 @@ chrono = { version = "0.4", default-features = false, features = [
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-no-provider",
 ], optional = true }
-rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
+# 0.23.45 is the first release with the RUSTSEC-2026-0285 fix (riptering 0.6
+# requires it as well).
+rustls = { version = "0.23.45", default-features = false, features = ["std"], optional = true }
 webpki-roots = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "macros", "time"], optional = true }
 # Constant-time comparisons — only used by the `tsp` module (token.rs).
@@ -95,7 +100,7 @@ tempfile = "3"
 x509-cert = { version = "0.2", features = ["pem", "builder"] }
 rand = "0.8"
 # Test fixture generation only. Production cryptography is provided solely by
-# Kryptering, so alternate feature trees do not acquire these implementations.
+# riptering, so alternate feature trees do not acquire these implementations.
 rsa = { version = "0.9", features = ["sha2"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
 p256 = { version = "0.13", features = ["ecdsa"] }

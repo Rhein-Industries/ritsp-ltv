@@ -9,7 +9,7 @@ fn digest_requires_explicit_backend_initialization() {
         .expect_err("FIPS digest before initialization must fail");
     assert!(matches!(
         error,
-        kryptering::Error::BackendNotInitialized { .. }
+        riptering::Error::BackendNotInitialized { .. }
     ));
 }
 
@@ -20,6 +20,6 @@ fn https_client_requires_explicit_backend_initialization() {
         .expect_err("FIPS HTTPS client before initialization must fail");
     assert!(matches!(
         error,
-        tsp_ltv::net::HttpClientError::Crypto(kryptering::Error::BackendNotInitialized { .. })
+        tsp_ltv::net::HttpClientError::Crypto(riptering::Error::BackendNotInitialized { .. })
     ));
 }
