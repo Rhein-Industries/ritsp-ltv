@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.5.0 — first ritsp-ltv release
+## 0.5.0 — 2026-09-24 — first ritsp-ltv release
 
-Not yet published to crates.io. Changes relative to tsp-ltv 0.4.0:
+Changes relative to tsp-ltv 0.4.0:
 
 - **Renamed** to `ritsp-ltv` (`use ritsp_ltv::...`), Rhein Industries'
   maintained fork of tsp-ltv.
