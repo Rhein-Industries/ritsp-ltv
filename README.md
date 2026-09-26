@@ -18,8 +18,8 @@ stores, and certificate chain building used by
 [underskrift](https://github.com/kushaldas/underskrift) (PAdES/CAdES),
 bergshamra (XAdES), and jades (JAdES).
 
-Version 0.5 requires Rust 1.88 and delegates all cryptographic operations and
-TLS provider configuration to `riptering` 0.6, Rhein Industries' maintained fork
+Version 0.6 requires Rust 1.88 and delegates all cryptographic operations and
+TLS provider configuration to `riptering` 0.7, Rhein Industries' maintained fork
 of `kryptering`.
 
 ## Features
@@ -52,11 +52,11 @@ of `kryptering`.
 This crate is **format-agnostic** — it does not know about PDF, XML, or JSON.
 Each AdES crate builds its own format-specific embedding (DSS dictionaries for
 PAdES, XAdES qualifying properties, JAdES `etsiU` headers) on top of these
-shared clients. Consumer crates typically re-export tsp-ltv modules as thin
-facades (e.g. `pub use tsp_ltv::trust::*;`).
+shared clients. Consumer crates can re-export ritsp-ltv modules as thin
+facades (e.g. `pub use ritsp_ltv::trust::*;`).
 
 ```
-tsp-ltv (this crate)
+ritsp-ltv (this crate)
    ├── tsp     — RFC 3161 TSA client + ASN.1 parsing
    ├── ltv     — OCSP, CRL, chain building, revocation
    ├── trust   — trust stores, chain building from cert pools, chain validation
@@ -75,7 +75,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tsp-ltv = "0.4"
+ritsp-ltv = "0.6"
 ```
 
 Defaults are `tsp`, `ltv`, `blocking`, `rustcrypto`, `tls-ring`, and
@@ -83,7 +83,7 @@ Defaults are `tsp`, `ltv`, `blocking`, `rustcrypto`, `tls-ring`, and
 
 ```toml
 [dependencies]
-tsp-ltv = { version = "0.4", default-features = false, features = ["tsp", "rustcrypto", "tls-ring"] }
+ritsp-ltv = { version = "0.6", default-features = false, features = ["tsp", "rustcrypto", "tls-ring"] }
 ```
 
 For crates that only need trust store management and certificate verification
@@ -91,7 +91,7 @@ For crates that only need trust store management and certificate verification
 
 ```toml
 [dependencies]
-tsp-ltv = { version = "0.4", default-features = false, features = ["rustcrypto"] }
+ritsp-ltv = { version = "0.6", default-features = false, features = ["rustcrypto"] }
 ```
 
 This gives you access to the `trust` and `crypto` modules without pulling in
@@ -100,7 +100,7 @@ OCSP, CRL, or TSP client dependencies.
 ### Request a timestamp
 
 ```rust
-use tsp_ltv::tsp::{TsaClient, TsaClientPool};
+use ritsp_ltv::tsp::{TsaClient, TsaClientPool};
 
 let client = TsaClient::new("http://timestamp.digicert.com")?;
 let hash = vec![0u8; 32]; // SHA-256 hash of signature value
@@ -117,7 +117,7 @@ let token = pool.timestamp(&hash).await?;
 ### Check certificate revocation
 
 ```rust
-use tsp_ltv::ltv::{OcspClient, CrlClient, RevocationConfig, check_certificate_revocation};
+use ritsp_ltv::ltv::{OcspClient, CrlClient, RevocationConfig, check_certificate_revocation};
 
 let ocsp = OcspClient::new()?;
 let crl = CrlClient::new()?;
@@ -131,7 +131,7 @@ let status = check_certificate_revocation(
 ### Load trust anchors
 
 ```rust
-use tsp_ltv::trust::{TrustStore, TrustStoreSet};
+use ritsp_ltv::trust::{TrustStore, TrustStoreSet};
 
 let sig_store = TrustStore::from_pem_file("ca-certs.pem")?;
 let tsa_store = TrustStore::from_pem_directory("/etc/ssl/certs")?;
@@ -144,7 +144,7 @@ let stores = TrustStoreSet::new()
 ### Build and verify a certificate chain
 
 ```rust
-use tsp_ltv::trust::{TrustStore, build_chain_from_pool, trust_anchor_subjects};
+use ritsp_ltv::trust::{TrustStore, build_chain_from_pool, trust_anchor_subjects};
 
 // Load trust anchors
 let trust_store = TrustStore::from_pem_file("ca-certs.pem")?;

@@ -1,5 +1,22 @@
 # Validation profiles and compatibility
 
+## Upgrading from 0.5 to 0.6
+
+Update the dependency to `ritsp-ltv = "0.6"` and refresh the consumer lockfile.
+Applications that also depend on riptering must select its 0.7 release line:
+ritsp-ltv re-exports riptering types, and types from the older release line are
+distinct. The MSRV remains Rust 1.88 and provider features keep their names.
+
+Review timestamp inputs for the required ESS certificate binding and supported
+TSA certificate/name profile. For delegated OCSP responses, migrate issuer-only
+validation to the path-aware APIs described below and provide the complete
+issuer path and trust store. Strict nonce echo checking is optional; the default
+remains opportunistic. Unsupported profiles and malformed extensions now fail
+closed, so successful validation under the previous release does not guarantee
+acceptance after upgrading. No option bypasses the timestamp certificate binding.
+
+## Supported validation profiles
+
 Timestamp verification requires a signed ESS `SigningCertificate` (SHA-1
 certificate identification) or `SigningCertificateV2` (SHA-256 by default,
 or supported SHA-2/SHA-3 algorithm). Both attributes are independently
