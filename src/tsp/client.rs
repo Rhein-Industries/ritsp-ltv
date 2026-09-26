@@ -15,6 +15,7 @@ const TSP_REQUEST_CONTENT_TYPE: &str = "application/timestamp-query";
 
 /// HTTP Content-Type for RFC 3161 timestamp responses.
 const TSP_RESPONSE_CONTENT_TYPE: &str = "application/timestamp-reply";
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 /// RFC 3161 Time-Stamp Authority client.
 ///
@@ -49,6 +50,7 @@ pub struct TsaClient {
     policy_oid: Option<const_oid::ObjectIdentifier>,
     /// HTTP request timeout.
     timeout: Duration,
+    max_body_size: usize,
     /// Whether to request the TSA certificate in the response.
     cert_req: bool,
     /// TSA signing certificates supplied out-of-band, used to verify the
@@ -73,6 +75,7 @@ impl TsaClient {
             digest_algorithm: DigestAlgorithm::Sha256,
             policy_oid: None,
             timeout: Duration::from_secs(30),
+            max_body_size: MAX_BODY_SIZE,
             cert_req: true,
             verification_certs: Vec::new(),
         })
@@ -93,6 +96,12 @@ impl TsaClient {
     /// Set the HTTP request timeout.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Set the maximum downloaded timestamp response size (10 MiB by default).
+    pub fn max_body_size(mut self, max: usize) -> Self {
+        self.max_body_size = max;
         self
     }
 
@@ -218,10 +227,7 @@ impl TsaClient {
         }
 
         // Read the response body
-        let resp_bytes = response
-            .bytes()
-            .await
-            .map_err(|e| TspError::HttpError(format!("failed to read TSA response body: {e}")))?;
+        let resp_bytes = self.read_response_body(response).await?;
 
         log::debug!(
             "Received TimeStampResp from {} ({} bytes)",
@@ -231,12 +237,13 @@ impl TsaClient {
 
         // Parse and validate the response
         let resp = token::parse_timestamp_response(&resp_bytes)?;
-        let token_der = token::validate_timestamp_response(
+        let token_der = token::validate_timestamp_response_for_policy(
             &resp,
             data_hash,
             Some(nonce),
             self.digest_algorithm,
             &self.verification_certs,
+            self.policy_oid.as_ref(),
         )?;
 
         log::debug!(
@@ -246,6 +253,34 @@ impl TsaClient {
         );
 
         Ok(token_der)
+    }
+
+    async fn read_response_body(
+        &self,
+        mut response: reqwest::Response,
+    ) -> Result<Vec<u8>, TspError> {
+        if response
+            .content_length()
+            .is_some_and(|len| len > self.max_body_size as u64)
+        {
+            return Err(TspError::HttpError(
+                "TSA response exceeds max body size".into(),
+            ));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| TspError::HttpError(format!("failed to read TSA response body: {e}")))?
+        {
+            if chunk.len() > self.max_body_size.saturating_sub(body.len()) {
+                return Err(TspError::HttpError(
+                    "TSA response exceeds max body size".into(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 
     /// Blocking variant of [`timestamp`](Self::timestamp).
@@ -353,6 +388,44 @@ impl TsaClientPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_timestamp_policy_is_bound() {
+        let policy = const_oid::ObjectIdentifier::new_unwrap("1.2.3.4");
+        assert!(token::check_tst_policy(Some("1.2.3.4"), Some(&policy)).is_ok());
+        assert!(token::check_tst_policy(Some("1.2.3.5"), Some(&policy)).is_err());
+        assert!(token::check_tst_policy(None, Some(&policy)).is_err());
+        assert!(token::check_tst_policy(Some("1.2.3.5"), None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn timestamp_body_limits_cover_lengths_and_chunked_bodies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (wire, limit, succeeds) in [
+            ("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nDATA", 4, true),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nDATA", 3, false),
+            ("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nDATA\r\n0\r\n\r\n", 3, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream.write_all(wire.as_bytes()).await.unwrap();
+            });
+            // The transport fixture is explicitly local; no production URL guard
+            // exception is introduced by exercising the private body reader.
+            let transport = crate::net::hardened_http_client().unwrap();
+            let response = transport.client()
+                .get(format!("http://{address}/")).send().await.unwrap();
+            let client = TsaClient::new("http://fixture.invalid").unwrap().max_body_size(limit);
+            let result = client.read_response_body(response).await;
+            assert_eq!(result.is_ok(), succeeds);
+            if succeeds { assert_eq!(result.unwrap(), b"DATA"); }
+            task.await.unwrap();
+        }
+    }
 
     #[test]
     fn test_tsa_client_default() {

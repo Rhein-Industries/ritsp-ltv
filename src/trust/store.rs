@@ -189,6 +189,8 @@ fn enforce_path_len(
 ///   requires a critical `id-kp-timeStamping` EKU on the TSA signer
 ///   (`tsp::token::require_timestamping_eku`, RFC 3161 §2.3), and the `ltv`
 ///   build additionally binds the leaf via `verify_chain_for_purpose`.
+///   Critical CA EKUs fail closed: ancestor application-purpose restrictions
+///   are not implemented by this verifier.
 ///
 /// Extensions whose *only* processing path lives behind the `ltv` feature
 /// (`subjectAltName`, `cRLDistributionPoints`, `authorityInfoAccess`,
@@ -228,6 +230,24 @@ const RECOGNIZED_CRITICAL_EXT_OIDS_LTV: &[&str] = &[
     crate::ltv::name_constraints::NAME_CONSTRAINTS_OID, // 2.5.29.30 nameConstraints
 ];
 
+/// Reject repeated extension OIDs before first-match extension parsers can
+/// resolve conflicting values differently (RFC 5280 §4.2).
+fn reject_duplicate_extensions(cert: &Certificate, label: &str) -> Result<(), TrustError> {
+    let Some(extensions) = &cert.tbs_certificate.extensions else {
+        return Ok(());
+    };
+    let mut seen = std::collections::HashSet::with_capacity(extensions.len());
+    for ext in extensions {
+        if !seen.insert(ext.extn_id) {
+            return Err(TrustError::ProfileViolation(format!(
+                "{label} has duplicate extension {}",
+                ext.extn_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Reject a certificate that asserts a **critical** extension this crate does
 /// not recognise (RFC 5280 §4.2: "A certificate-using system MUST reject the
 /// certificate if it encounters a critical extension it does not recognize or
@@ -248,6 +268,11 @@ fn reject_unknown_critical_extensions(cert: &Certificate, label: &str) -> Result
             continue;
         }
         let oid = ext.extn_id.to_string();
+        if oid == "2.5.29.37" && basic_constraints(cert)?.0 {
+            return Err(TrustError::ProfileViolation(format!(
+                "{label} has an unsupported critical CA extendedKeyUsage restriction"
+            )));
+        }
         // `mut` is used only under `ltv` (the extra-OID branch below); tsp-only
         // builds never reassign it.
         #[allow(unused_mut)]
@@ -710,7 +735,7 @@ impl TrustStore {
         chain: &[Certificate],
         validation_time: Option<der::DateTime>,
     ) -> Result<&Certificate, TrustError> {
-        self.verify_chain_inner(chain, validation_time, None)
+        self.verify_chain_inner(chain, validation_time, None, false)
     }
 
     /// Verify a certificate chain and additionally bind the **leaf**
@@ -736,7 +761,32 @@ impl TrustStore {
         validation_time: Option<der::DateTime>,
         purpose: crate::ltv::CertRole,
     ) -> Result<&Certificate, TrustError> {
-        self.verify_chain_inner(chain, validation_time, Some(purpose))
+        self.verify_chain_inner(chain, validation_time, Some(purpose), false)
+    }
+
+    #[cfg(feature = "ltv")]
+    pub(crate) fn verify_chain_for_purpose_with_fraction(
+        &self,
+        chain: &[Certificate],
+        time: der::DateTime,
+        purpose: crate::ltv::CertRole,
+        positive_fraction: bool,
+    ) -> Result<&Certificate, TrustError> {
+        self.verify_chain_inner(chain, Some(time), Some(purpose), positive_fraction)
+    }
+
+    #[cfg(feature = "tsp")]
+    pub(crate) fn verify_timestamp_chain(
+        &self,
+        chain: &[Certificate],
+        time: der::DateTime,
+        positive_fraction: bool,
+    ) -> Result<&Certificate, TrustError> {
+        #[cfg(feature = "ltv")]
+        let purpose = Some(crate::ltv::CertRole::TimestampSigner);
+        #[cfg(not(feature = "ltv"))]
+        let purpose = None;
+        self.verify_chain_inner(chain, Some(time), purpose, positive_fraction)
     }
 
     /// Core chain verification. `leaf_purpose`, when `Some`, binds the leaf
@@ -747,6 +797,7 @@ impl TrustStore {
         validation_time: Option<der::DateTime>,
         #[cfg(feature = "ltv")] leaf_purpose: Option<crate::ltv::CertRole>,
         #[cfg(not(feature = "ltv"))] leaf_purpose: Option<()>,
+        positive_fraction: bool,
     ) -> Result<&Certificate, TrustError> {
         let policy = &self.signature_policy;
         if chain.is_empty() {
@@ -756,6 +807,7 @@ impl TrustStore {
         // RFC 5280 §4.2: reject any certificate (leaf, intermediate, or anchor)
         // that asserts an unrecognized *critical* extension — fail closed.
         for (i, cert) in chain.iter().enumerate() {
+            reject_duplicate_extensions(cert, &format!("certificate at index {i}"))?;
             reject_unknown_critical_extensions(cert, &format!("certificate at index {i}"))?;
         }
 
@@ -783,7 +835,9 @@ impl TrustStore {
                         not_before: validity.not_before.to_date_time(),
                     });
                 }
-                if time > validity.not_after.to_date_time() {
+                if time > validity.not_after.to_date_time()
+                    || (positive_fraction && time == validity.not_after.to_date_time())
+                {
                     return Err(TrustError::Expired {
                         index: i,
                         not_after: validity.not_after.to_date_time(),
@@ -877,50 +931,59 @@ impl TrustStore {
         // subject name but have different keys (e.g., re-issued roots).
         let mut last_err = None;
         for anchor in &candidates {
-            match crate::crypto::verify::verify_certificate_signature_with_policy(
-                last, anchor, policy,
-            ) {
-                Ok(()) => {
-                    // The anchor is not part of `chain`, so its own critical
-                    // extensions were not checked in the per-chain loop above —
-                    // check them here (RFC 5280 §4.2 MUST-reject, fail closed).
-                    reject_unknown_critical_extensions(anchor, "trust anchor")?;
-                    validate_intermediate_ca_extensions(anchor, "trust anchor")?;
+            // A same-key reissue may verify the signature but have a different
+            // validity/profile/constraint path. Treat every candidate as a
+            // complete path; a later failure must not prevent another valid
+            // configured anchor from being tried.
+            let candidate_result = (|| {
+                crate::crypto::verify::verify_certificate_signature_with_policy(
+                    last, anchor, policy,
+                )?;
+                // The anchor is not part of `chain`, so its own critical
+                // extensions were not checked in the per-chain loop above —
+                // check them here (RFC 5280 §4.2 MUST-reject, fail closed).
+                reject_duplicate_extensions(anchor, "trust anchor")?;
+                reject_unknown_critical_extensions(anchor, "trust anchor")?;
+                validate_intermediate_ca_extensions(anchor, "trust anchor")?;
 
-                    // Enforce the anchor's own pathLenConstraint. The chain
-                    // builder stops before appending the anchor, so this anchor
-                    // is not in `chain` and its constraint would otherwise never
-                    // be checked. Every certificate in `chain` is subordinate to
-                    // it.
-                    enforce_path_len(anchor, chain, "trust anchor")?;
+                // Enforce the anchor's own pathLenConstraint. The chain
+                // builder stops before appending the anchor, so this anchor
+                // is not in `chain` and its constraint would otherwise never
+                // be checked. Every certificate in `chain` is subordinate to
+                // it.
+                enforce_path_len(anchor, chain, "trust anchor")?;
 
-                    // Signature verified — now check anchor time validity
-                    if let Some(time) = validation_time {
-                        let validity = &anchor.tbs_certificate.validity;
-                        if time < validity.not_before.to_date_time() {
-                            return Err(TrustError::NotYetValid {
-                                index: chain.len(),
-                                not_before: validity.not_before.to_date_time(),
-                            });
-                        }
-                        if time > validity.not_after.to_date_time() {
-                            return Err(TrustError::Expired {
-                                index: chain.len(),
-                                not_after: validity.not_after.to_date_time(),
-                            });
-                        }
+                // Signature verified — now check anchor time validity
+                if let Some(time) = validation_time {
+                    let validity = &anchor.tbs_certificate.validity;
+                    if time < validity.not_before.to_date_time() {
+                        return Err(TrustError::NotYetValid {
+                            index: chain.len(),
+                            not_before: validity.not_before.to_date_time(),
+                        });
                     }
-
-                    // Enforce name constraints over the full path with the anchor
-                    // appended (it is not in `chain`).
-                    #[cfg(feature = "ltv")]
+                    if time > validity.not_after.to_date_time()
+                        || (positive_fraction && time == validity.not_after.to_date_time())
                     {
-                        let mut path: Vec<&Certificate> = chain.iter().collect();
-                        path.push(anchor);
-                        enforce_name_constraints_path(&path)?;
+                        return Err(TrustError::Expired {
+                            index: chain.len(),
+                            not_after: validity.not_after.to_date_time(),
+                        });
                     }
-                    return Ok(anchor);
                 }
+
+                // Enforce name constraints over the full path with the anchor
+                // appended (it is not in `chain`).
+                #[cfg(feature = "ltv")]
+                {
+                    let mut path: Vec<&Certificate> = chain.iter().collect();
+                    path.push(anchor);
+                    enforce_name_constraints_path(&path)?;
+                }
+                Ok(*anchor)
+            })();
+            match candidate_result {
+                Ok(anchor) => return Ok(anchor),
                 Err(e) => {
                     last_err = Some(e);
                     // Try next candidate
@@ -928,7 +991,7 @@ impl TrustStore {
             }
         }
 
-        // All candidates failed signature verification
+        // All candidate paths failed validation.
         Err(last_err.unwrap())
     }
 }
@@ -1483,6 +1546,59 @@ mod tests {
         }
     }
 
+    fn fixture_certificate(pem: &[u8]) -> Certificate {
+        let (_, cert_der) = pem_rfc7468::decode_vec(pem).unwrap();
+        Certificate::from_der(&cert_der).unwrap()
+    }
+
+    fn fixture_anchor_with_duplicate_extension() -> Certificate {
+        let mut anchor = fixture_certificate(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ca_cert.pem"
+        )));
+        let repeated = ext("1.2.3.4.5", false, &[0x05, 0x00]);
+        let extensions = anchor.tbs_certificate.extensions.get_or_insert_default();
+        extensions.push(repeated.clone());
+        extensions.push(repeated);
+        anchor
+    }
+
+    #[test]
+    fn test_verify_chain_rejects_duplicate_extensions_in_chain() {
+        let anchor = fixture_anchor_with_duplicate_extension();
+        let mut store = TrustStore::new();
+        store.add_certificate(anchor.clone()).unwrap();
+
+        let err = store
+            .verify_chain(&[anchor], None)
+            .expect_err("a chain certificate with duplicate noncritical OIDs must reject");
+        assert!(
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("duplicate extension")),
+            "expected duplicate-extension rejection before signature processing, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_chain_rejects_duplicate_extensions_on_external_anchor() {
+        let anchor = fixture_anchor_with_duplicate_extension();
+        let intermediate = fixture_certificate(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/intermediate_ca_cert.pem"
+        )));
+        let mut store = TrustStore::new();
+        store.add_certificate(anchor).unwrap();
+
+        // The fixture issuer key still verifies the intermediate. Only the
+        // separately configured anchor's extension list has been changed.
+        let err = store
+            .verify_chain(&[intermediate], None)
+            .expect_err("duplicate OIDs must reject even when the anchor is absent from chain");
+        assert!(
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("trust anchor has duplicate extension")),
+            "expected external-anchor duplicate rejection, got: {err:?}"
+        );
+    }
+
     #[test]
     fn test_verify_chain_rejects_unknown_critical_extension() {
         // B4/M3: a self-signed anchor that asserts a *critical* extension we do
@@ -1559,7 +1675,8 @@ mod tests {
             "expected unrecognized-critical-extension rejection, got: {err:?}"
         );
 
-        // 2.5.29.37 extendedKeyUsage, marked critical -> still accepted.
+        // Critical EKU on a CA restricts application purposes across a path;
+        // this generic verifier cannot silently treat it as a processed leaf.
         let eku_root = root_with_extensions(
             "CN=Critical EKU Root,O=ritsp-ltv tests",
             &key,
@@ -1567,9 +1684,10 @@ mod tests {
         );
         let mut store = TrustStore::new();
         store.add_certificate(eku_root.clone()).unwrap();
-        store
+        let err = store
             .verify_chain(&[eku_root], None)
-            .expect("a critical extendedKeyUsage is processed and must be accepted");
+            .expect_err("unsupported critical CA EKU must fail closed");
+        assert!(err.to_string().contains("critical CA extendedKeyUsage"));
     }
 
     /// Build `[leaf, root]` where the root is a CA anchor and `leaf` is signed by
@@ -1909,6 +2027,141 @@ mod tests {
             matches!(err, TrustError::ProfileViolation(ref m) if m.contains("unsupported name constraint")),
             "expected unsupported-name-constraint rejection, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn alternate_same_key_anchor_is_tried_after_profile_and_time_failures() {
+        let parse =
+            |pem: &[u8]| Certificate::from_der(&pem_rfc7468::decode_vec(pem).unwrap().1).unwrap();
+        let root = parse(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/intermediate_ca_cert.pem"
+        )));
+        let leaf = parse(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/signer_cert.pem"
+        )));
+        let at = der::DateTime::new(2026, 6, 1, 12, 0, 0).unwrap();
+        let mut bad_profile = root.clone();
+        bad_profile
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(ext("1.2.3.4.999", true, &[0x05, 0x00]));
+        let mut expired = root.clone();
+        expired.tbs_certificate.validity.not_after =
+            x509_cert::time::Time::GeneralTime(der::asn1::GeneralizedTime::from_date_time(
+                der::DateTime::new(2025, 1, 1, 0, 0, 0).unwrap(),
+            ));
+        let mut critical_ca_eku = root.clone();
+        critical_ca_eku
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(ext(
+                "2.5.29.37",
+                true,
+                &[
+                    0x30, 0x0A, 0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01,
+                ],
+            ));
+        for bad in [bad_profile, expired, critical_ca_eku] {
+            let mut only_bad = TrustStore::new();
+            only_bad.add_certificate(bad.clone()).unwrap();
+            assert!(only_bad
+                .verify_chain(std::slice::from_ref(&leaf), Some(at))
+                .is_err());
+            let mut alternatives = TrustStore::new();
+            alternatives.add_certificate(bad).unwrap();
+            alternatives.add_certificate(root.clone()).unwrap();
+            assert_eq!(
+                alternatives
+                    .verify_chain(std::slice::from_ref(&leaf), Some(at))
+                    .unwrap(),
+                &root
+            );
+        }
+        let mut end_boundary = root.clone();
+        end_boundary.tbs_certificate.validity.not_after =
+            x509_cert::time::Time::GeneralTime(der::asn1::GeneralizedTime::from_date_time(at));
+        let mut alternatives = TrustStore::new();
+        alternatives.add_certificate(end_boundary).unwrap();
+        assert!(alternatives
+            .verify_chain_inner(std::slice::from_ref(&leaf), Some(at), None, true)
+            .is_err());
+        alternatives.add_certificate(root.clone()).unwrap();
+        assert_eq!(
+            alternatives
+                .verify_chain_inner(std::slice::from_ref(&leaf), Some(at), None, true)
+                .unwrap(),
+            &root
+        );
+        // The same rule applies to path-level constraints, not just profiles.
+        #[cfg(feature = "ltv")]
+        {
+            use crate::der_utils;
+            use rsa::pkcs1v15::SigningKey;
+            use rsa::pkcs8::DecodePrivateKey;
+            use sha2::Sha256;
+            use x509_cert::builder::Profile;
+            let key = rsa::RsaPrivateKey::from_pkcs8_der(
+                &pem_rfc7468::decode_vec(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/intermediate_ca_key.pem"
+                )))
+                .unwrap()
+                .1,
+            )
+            .unwrap();
+            let signer = SigningKey::<Sha256>::new(key.clone());
+            let unconstrained = issue_cert(
+                Profile::Root,
+                "CN=Alternate Constrained Anchor",
+                &key,
+                &signer,
+            );
+            let nc = der_utils::encode_sequence_raw(&der_utils::encode_tlv(
+                0xA0,
+                &der_utils::encode_sequence_raw(&der_utils::encode_tlv(
+                    0xA4,
+                    &"CN=Only Permitted Name"
+                        .parse::<x509_cert::name::Name>()
+                        .unwrap()
+                        .to_der()
+                        .unwrap(),
+                )),
+            ));
+            let constrained = root_with_extensions(
+                "CN=Alternate Constrained Anchor",
+                &key,
+                vec![ext("2.5.29.30", true, &nc)],
+            );
+            let leaf_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+            let leaf = issue_cert(
+                Profile::Leaf {
+                    issuer: unconstrained.tbs_certificate.subject.clone(),
+                    enable_key_agreement: false,
+                    enable_key_encipherment: false,
+                },
+                "CN=Different Leaf",
+                &leaf_key,
+                &signer,
+            );
+            let mut store = TrustStore::new();
+            store.add_certificate(constrained).unwrap();
+            assert!(store
+                .verify_chain(std::slice::from_ref(&leaf), None)
+                .is_err());
+            store.add_certificate(unconstrained.clone()).unwrap();
+            assert_eq!(
+                store
+                    .verify_chain(std::slice::from_ref(&leaf), None)
+                    .unwrap(),
+                &unconstrained
+            );
+        }
     }
 
     // ── B5: trust-store directory load failures are surfaced ──────

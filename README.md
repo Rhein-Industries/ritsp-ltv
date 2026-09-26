@@ -183,6 +183,22 @@ an `AttestedHttpClient`; raw `reqwest::Client` injection is unavailable in
 FIPS builds. Non-FIPS callers that deliberately accept the risk must use the
 explicitly named `unverified_http_client` escape hatch.
 
+Hardened clients validate DNS answers at connection time, including redirect
+hostnames, and disable environment proxies. They default to a 10-second
+connection timeout and a 30-second request timeout. TSA and OCSP downloads have
+configurable 10 MiB limits; the CRL cache retains at most 64 entries and 32 MiB
+of DER. Reuse or clone client instances to retain their connection pools and
+caches. See [local performance checks](docs/local-performance.md).
+
+Delegated OCSP responses require a complete issuer path and trust store, even
+when `nocheck` is present. Use `check_revocation_detailed_with_issuer_path`, or
+the async `check_certificate_revocation_with_ocsp_context` orchestrator; the
+issuer-only helpers reject delegated responders. Strict nonce echo checking
+is opt-in. Timestamp verification requires an ESS certificate binding and
+checks any TSTInfo TSA name. Malformed DER, duplicate extensions, and
+unsupported critical CRL or timestamp extensions are rejected. Supported
+profiles and migration details are in [validation profiles](docs/validation-profiles.md).
+
 In FIPS builds, call `initialize_backend()` before digesting, validation, or
 HTTPS client creation. Enabling the feature does not itself certify the
 application or deployment.

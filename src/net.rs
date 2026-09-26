@@ -21,17 +21,19 @@
 //!   multicast, CGNAT, ...), run before any network egress.
 //! - [`hardened_http_client`] — a `reqwest::Client` whose redirect policy is
 //!   bounded ([`MAX_REDIRECTS`]) and refuses to follow redirects to literal
-//!   non-public addresses.
+//!   non-public addresses. Its connection resolver checks every DNS answer,
+//!   including redirect hostnames, before returning the addresses to reqwest.
 //! - [`is_disallowed_ip`] — the address classifier shared by both.
 //!
-//! **Residual limitation (documented, not silently ignored).** Resolution here
-//! and `reqwest`'s connect-time resolution are two separate lookups, so a
-//! DNS-rebinding attacker who flips the record between them is not fully
-//! prevented, and a redirect to a *hostname* that resolves internally is only
-//! caught for literal-IP targets. Fully closing these would require pinning the
-//! validated IP into the connection (custom resolver / per-request client).
+//! Hardened clients disable automatic environment proxies because a proxy can
+//! resolve the destination itself and bypass the connection resolver. They have
+//! default connection and whole-request timeouts; per-request timeouts can still
+//! be configured by callers. An initial literal-IP URL bypasses DNS, so callers
+//! handling attacker-influenced initial URLs must retain [`validate_fetch_url`].
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::Client;
 
@@ -86,6 +88,24 @@ impl AttestedHttpClient {
 /// Maximum HTTP redirects followed by a [`hardened_http_client`].
 pub const MAX_REDIRECTS: usize = 5;
 
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolve and check the exact address set handed to the HTTP connector.
+/// This covers new connections to redirect hostnames as well as initial hosts.
+#[derive(Debug)]
+struct PublicDnsResolver;
+
+impl reqwest::dns::Resolve for PublicDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs = resolve_public_host(&host, 0).await?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 /// Classify an IPv4 address as non-public so the SSRF guard can refuse it.
 ///
 /// This is the stable-Rust equivalent of "not [`Ipv4Addr::is_global`]" (which
@@ -124,7 +144,8 @@ pub fn is_disallowed_ip(ip: IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_disallowed_ipv4(v4);
             }
-            let first = v6.segments()[0];
+            let segments = v6.segments();
+            let first = segments[0];
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -132,6 +153,13 @@ pub fn is_disallowed_ip(ip: IpAddr) -> bool {
                 || (first & 0xfe00) == 0xfc00
                 // link-local unicast fe80::/10
                 || (first & 0xffc0) == 0xfe80
+                // deprecated site-local unicast fec0::/10
+                || (first & 0xffc0) == 0xfec0
+                // documentation 2001:db8::/32 and 3fff::/20
+                || (first == 0x2001 && segments[1] == 0x0db8)
+                || (first == 0x3fff && (segments[1] & 0xf000) == 0)
+                // discard-only 100::/64
+                || (first == 0x0100 && segments[1..4] == [0, 0, 0])
         }
     }
 }
@@ -144,9 +172,9 @@ fn unbracket(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-/// Build an HTTP client with a bounded redirect policy that refuses to follow
-/// redirects to literal non-public addresses — complementing the resolve-time
-/// check in [`validate_fetch_url`].
+/// Build an HTTP client with bounded redirects, connect/request timeouts and a
+/// resolver that refuses non-public destinations, including redirect hostnames.
+/// Initial literal addresses must still be checked by [`validate_fetch_url`].
 ///
 /// Fails closed: a build or provider-attestation failure is returned rather
 /// than degrading to reqwest's default TLS or redirect behavior.
@@ -157,8 +185,19 @@ pub fn hardened_http_client() -> Result<AttestedHttpClient, HttpClientError> {
 }
 
 /// Build a hardened HTTP client from a riptering-attested TLS configuration.
+///
+/// Automatic environment proxies are disabled to preserve destination-address
+/// checks. Deployments requiring a proxy must supply their own network policy
+/// through the explicit non-FIPS `unverified_http_client` escape hatch.
 pub fn attested_http_client(
     tls: riptering::AttestedTlsConfig,
+) -> Result<AttestedHttpClient, HttpClientError> {
+    build_attested_http_client(tls, |builder| builder)
+}
+
+fn build_attested_http_client(
+    tls: riptering::AttestedTlsConfig,
+    configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
 ) -> Result<AttestedHttpClient, HttpClientError> {
     let policy = reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= MAX_REDIRECTS {
@@ -175,11 +214,14 @@ pub fn attested_http_client(
         attempt.follow()
     });
     let config = tls.config();
-    let inner = Client::builder()
+    let builder = Client::builder()
         .redirect(policy)
-        .use_preconfigured_tls((*config).clone())
-        .build()
-        .map_err(HttpClientError::Build)?;
+        .dns_resolver(Arc::new(PublicDnsResolver))
+        .no_proxy()
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+        .timeout(DEFAULT_REQUEST_TIMEOUT)
+        .use_preconfigured_tls((*config).clone());
+    let inner = configure(builder).build().map_err(HttpClientError::Build)?;
     Ok(AttestedHttpClient {
         inner,
         backend: riptering::backend_info()?,
@@ -238,6 +280,40 @@ impl std::fmt::Display for UrlGuardError {
     }
 }
 
+impl std::error::Error for UrlGuardError {}
+
+async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, UrlGuardError> {
+    let host_for_lookup = host.to_owned();
+    let addrs = tokio::task::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        (host_for_lookup.as_str(), port)
+            .to_socket_addrs()
+            .map(|it| it.collect::<Vec<_>>())
+    })
+    .await
+    .map_err(|e| UrlGuardError::Resolution(format!("DNS resolution task failed: {e}")))?
+    .map_err(|e| UrlGuardError::Resolution(format!("{host}: {e}")))?;
+    validate_resolved_addresses(host, addrs)
+}
+
+fn validate_resolved_addresses(
+    host: &str,
+    addrs: Vec<SocketAddr>,
+) -> Result<Vec<SocketAddr>, UrlGuardError> {
+    if addrs.is_empty() {
+        return Err(UrlGuardError::NoAddresses(host.to_owned()));
+    }
+    for addr in &addrs {
+        if is_disallowed_ip(addr.ip()) {
+            return Err(UrlGuardError::NonPublic(format!(
+                "{host} resolved to {}",
+                addr.ip()
+            )));
+        }
+    }
+    Ok(addrs)
+}
+
 /// Validate that a URL is safe to fetch before any network egress.
 ///
 /// Enforces an `http`/`https` scheme allowlist **and** resolves the host,
@@ -270,29 +346,7 @@ pub async fn validate_fetch_url(url: &str) -> Result<(), UrlGuardError> {
     // Hostname: resolve off the async executor and reject any non-public
     // destination among the resolved addresses.
     let port = parsed.port_or_known_default().unwrap_or(0);
-    let host_owned = host_bare.to_string();
-    let host_for_lookup = host_owned.clone();
-    let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
-        use std::net::ToSocketAddrs;
-        (host_for_lookup.as_str(), port)
-            .to_socket_addrs()
-            .map(|it| it.collect::<Vec<_>>())
-    })
-    .await
-    .map_err(|e| UrlGuardError::Resolution(format!("DNS resolution task failed: {e}")))?
-    .map_err(|e| UrlGuardError::Resolution(format!("{host_owned}: {e}")))?;
-
-    if addrs.is_empty() {
-        return Err(UrlGuardError::NoAddresses(host_owned));
-    }
-    for addr in &addrs {
-        if is_disallowed_ip(addr.ip()) {
-            return Err(UrlGuardError::NonPublic(format!(
-                "{host_owned} resolved to {}",
-                addr.ip()
-            )));
-        }
-    }
+    resolve_public_host(host_bare, port).await?;
     Ok(())
 }
 
@@ -348,6 +402,13 @@ mod tests {
     }
 
     fn attested_client_with_root(root: Option<CertificateDer<'static>>) -> AttestedHttpClient {
+        attested_client_for_fixture(root, "localhost")
+    }
+
+    fn attested_client_for_fixture(
+        root: Option<CertificateDer<'static>>,
+        host: &str,
+    ) -> AttestedHttpClient {
         #[cfg(feature = "fips")]
         riptering::initialize_backend().expect("initialize FIPS backend for HTTPS unit test");
 
@@ -356,7 +417,12 @@ mod tests {
             roots.add(root).expect("add test trust anchor");
         }
         let tls = riptering::build_tls_client_config(roots).expect("attested test TLS config");
-        attested_http_client(tls).expect("attested test HTTP client")
+        // Test fixtures need an explicit loopback override. Production clients
+        // call the same builder with no overrides or resolver exceptions.
+        build_attested_http_client(tls, |builder| {
+            builder.resolve(host, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        })
+        .expect("attested test HTTP client")
     }
 
     #[test]
@@ -393,6 +459,113 @@ mod tests {
         assert!(is_disallowed_ip("255.255.255.255".parse().unwrap())); // broadcast
                                                                        // Documentation block stays blocked.
         assert!(is_disallowed_ip("203.0.113.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn reserved_ipv6_ranges_are_disallowed() {
+        for address in [
+            "2001:db8::1",              // documentation
+            "2001:db8:ffff:ffff::1",    // documentation upper boundary
+            "3fff::1",                  // documentation
+            "3fff:fff:ffff:ffff::1",    // documentation upper boundary
+            "100::1",                   // discard-only
+            "100::ffff:ffff:ffff:ffff", // discard-only upper boundary
+            "fec0::1",                  // deprecated site-local
+            "feff:ffff:ffff:ffff::1",   // site-local upper boundary
+            "::ffff:203.0.113.7",       // IPv4-mapped documentation
+        ] {
+            assert!(
+                is_disallowed_ip(address.parse().unwrap()),
+                "{address} must not be fetched"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_resolver_rejects_empty_or_mixed_non_public_answers() {
+        assert!(matches!(
+            validate_resolved_addresses("fixture.test", Vec::new()),
+            Err(UrlGuardError::NoAddresses(_))
+        ));
+        let public: SocketAddr = "8.8.8.8:0".parse().unwrap();
+        for blocked in ["127.0.0.1:0", "10.0.0.1:0", "[2001:db8::1]:0"] {
+            let blocked = blocked.parse().unwrap();
+            for answers in [vec![public, blocked], vec![blocked, public]] {
+                assert!(matches!(
+                    validate_resolved_addresses("fixture.test", answers),
+                    Err(UrlGuardError::NonPublic(_))
+                ));
+            }
+        }
+        let answers = vec![public, "[2606:4700:4700::1111]:0".parse().unwrap()];
+        assert_eq!(
+            validate_resolved_addresses("fixture.test", answers.clone()).unwrap(),
+            answers,
+            "the checked addresses must be the addresses supplied to the connector"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_resolver_rejects_localhost() {
+        use reqwest::dns::Resolve;
+
+        let result = PublicDnsResolver
+            .resolve("localhost".parse().unwrap())
+            .await;
+        let err = match result {
+            Ok(_) => panic!("production resolver must reject local hostname destinations"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("non-public address"));
+    }
+
+    #[tokio::test]
+    async fn redirect_to_non_public_hostname_is_rejected() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        // Only the synthetic first-hop host is overridden. The redirect uses
+        // the production resolver, which must reject localhost before connect.
+        let client = attested_client_for_fixture(None, "fixture.test");
+        let err = client
+            .client()
+            .get(format!("http://fixture.test:{port}/"))
+            .send()
+            .await
+            .expect_err("redirect to an internal hostname must reject");
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+        let mut rejected_by_guard = false;
+        while let Some(error) = cause {
+            if matches!(
+                error.downcast_ref::<UrlGuardError>(),
+                Some(UrlGuardError::NonPublic(_))
+            ) {
+                rejected_by_guard = true;
+                break;
+            }
+            cause = error.source();
+        }
+        assert!(
+            rejected_by_guard,
+            "expected the connection-time address guard, got: {err:?}"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

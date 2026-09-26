@@ -51,6 +51,9 @@ pub const NAME_CONSTRAINTS_OID: &str = "2.5.29.30";
 /// Subject Alternative Name OID (`2.5.29.17`).
 const SAN_OID: &str = "2.5.29.17";
 
+/// Legacy subject emailAddress attribute OID (RFC 5280 §4.1.2.6).
+const EMAIL_ADDRESS_OID: &str = "1.2.840.113549.1.9.1";
+
 // GeneralName context-specific tags (RFC 5280 §4.2.1.6).
 const GN_RFC822: u8 = 0x81; // [1] IA5String, primitive
 const GN_DNS: u8 = 0x82; // [2] IA5String, primitive
@@ -105,18 +108,13 @@ enum AssertedName {
 /// Accumulated name constraints gathered from the CA certificates above the
 /// certificate currently being checked.
 ///
-/// Per RFC 5280 §6.1.4 constraints accumulate down the chain: every certificate
-/// is checked against the union of all CAs' constraints above it.
+/// Per RFC 5280 §6.1.4 constraints accumulate down the chain: excluded subtrees
+/// form a union, while permitted subtrees from separate issuers intersect.
+/// A name must match a permitted subtree in each issuer's group of its type.
 #[derive(Debug, Default, Clone)]
 pub struct NameConstraintState {
-    permitted: Vec<GeneralNameBase>,
+    permitted: Vec<Vec<GeneralNameBase>>,
     excluded: Vec<GeneralNameBase>,
-    /// Whether any permitted subtree of a given type was seen. RFC 5280: if a
-    /// type has permitted subtrees, a name of that type must match at least one.
-    permitted_dns: bool,
-    permitted_rfc822: bool,
-    permitted_ip: bool,
-    permitted_directory: bool,
 }
 
 impl NameConstraintState {
@@ -154,15 +152,7 @@ impl NameConstraintState {
                 // permittedSubtrees [0]
                 0xA0 => {
                     let bases = parse_general_subtrees(sub_body)?;
-                    for b in bases {
-                        match &b {
-                            GeneralNameBase::Dns(_) => self.permitted_dns = true,
-                            GeneralNameBase::Rfc822(_) => self.permitted_rfc822 = true,
-                            GeneralNameBase::Ip(..) => self.permitted_ip = true,
-                            GeneralNameBase::Directory(_) => self.permitted_directory = true,
-                        }
-                        self.permitted.push(b);
-                    }
+                    self.permitted.push(bases);
                 }
                 // excludedSubtrees [1]
                 0xA1 => {
@@ -192,7 +182,12 @@ impl NameConstraintState {
         if self.is_empty() {
             return Ok(());
         }
-        let names = collect_asserted_names(cert)?;
+        let constrain_rfc822 = self
+            .excluded
+            .iter()
+            .chain(self.permitted.iter().flatten())
+            .any(|base| matches!(base, GeneralNameBase::Rfc822(_)));
+        let names = collect_asserted_names(cert, constrain_rfc822)?;
         for name in &names {
             self.check_name(name)?;
         }
@@ -208,25 +203,37 @@ impl NameConstraintState {
                 )));
             }
         }
-        // 2. Permitted subtrees: if any permitted subtree of this name's type
-        //    exists, the name must match at least one of them.
-        let (has_permitted_of_type, type_label) = match name {
-            AssertedName::Dns(_) => (self.permitted_dns, "dNSName"),
-            AssertedName::Rfc822(_) => (self.permitted_rfc822, "rfc822Name"),
-            AssertedName::Ip(_) => (self.permitted_ip, "iPAddress"),
-            AssertedName::Directory(_) => (self.permitted_directory, "directoryName"),
+        // 2. Alternatives within one issuer's permittedSubtrees form a union.
+        //    Every issuer's applicable group must permit the name, so adding a
+        //    subordinate CA's constraints can never broaden an ancestor's set.
+        let type_label = match name {
+            AssertedName::Dns(_) => "dNSName",
+            AssertedName::Rfc822(_) => "rfc822Name",
+            AssertedName::Ip(_) => "iPAddress",
+            AssertedName::Directory(_) => "directoryName",
         };
-        if has_permitted_of_type {
+        for group in &self.permitted {
+            let mut has_permitted_of_type = false;
             let mut matched = false;
-            for p in &self.permitted {
+            for p in group {
+                if !matches!(
+                    (p, name),
+                    (GeneralNameBase::Dns(_), AssertedName::Dns(_))
+                        | (GeneralNameBase::Rfc822(_), AssertedName::Rfc822(_))
+                        | (GeneralNameBase::Ip(..), AssertedName::Ip(_))
+                        | (GeneralNameBase::Directory(_), AssertedName::Directory(_))
+                ) {
+                    continue;
+                }
+                has_permitted_of_type = true;
                 if base_matches(p, name)? {
                     matched = true;
                     break;
                 }
             }
-            if !matched {
+            if has_permitted_of_type && !matched {
                 return Err(NameConstraintError::Violation(format!(
-                    "{type_label} {name:?} is outside every permitted subtree"
+                    "{type_label} {name:?} is outside an issuer's permitted subtrees"
                 )));
             }
         }
@@ -344,10 +351,15 @@ fn decode_base_general_name(tag: u8, body: &[u8]) -> Result<GeneralNameBase, Nam
 
 /// Gather the names a subordinate certificate asserts: its subject
 /// directoryName (always, when non-empty) and each supported subjectAltName
-/// entry. A SAN entry of an unsupported type is ignored *for matching* (it is
+/// entry. When mail constraints apply and the SAN extension is absent, legacy
+/// subject emailAddress attributes are also checked (RFC 5280 §4.2.1.10).
+/// A SAN entry of an unsupported type is ignored *for matching* (it is
 /// not constrainable by the types we implement); a *constraint* of an
 /// unsupported type is what fails closed (handled in `decode_base_general_name`).
-fn collect_asserted_names(cert: &Certificate) -> Result<Vec<AssertedName>, NameConstraintError> {
+fn collect_asserted_names(
+    cert: &Certificate,
+    constrain_rfc822: bool,
+) -> Result<Vec<AssertedName>, NameConstraintError> {
     let mut names = Vec::new();
 
     // Subject directoryName: the raw DER of the subject Name SEQUENCE. An empty
@@ -365,9 +377,30 @@ fn collect_asserted_names(cert: &Certificate) -> Result<Vec<AssertedName>, NameC
 
     // subjectAltName entries.
     let san_oid = const_oid::ObjectIdentifier::new_unwrap(SAN_OID);
-    if let Some(extensions) = &cert.tbs_certificate.extensions {
-        if let Some(ext) = extensions.iter().find(|e| e.extn_id == san_oid) {
-            collect_san_names(ext.extn_value.as_bytes(), &mut names)?;
+    let san = cert
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.iter().find(|ext| ext.extn_id == san_oid));
+    if let Some(ext) = san {
+        collect_san_names(ext.extn_value.as_bytes(), &mut names)?;
+    } else if constrain_rfc822 {
+        // The fallback applies only when the entire SAN extension is absent,
+        // not when a present SAN simply omits the rfc822Name name form.
+        let email_oid = const_oid::ObjectIdentifier::new_unwrap(EMAIL_ADDRESS_OID);
+        for rdn in &cert.tbs_certificate.subject.0 {
+            for attribute in rdn.0.iter().filter(|attribute| attribute.oid == email_oid) {
+                let email: der::asn1::Ia5StringRef<'_> =
+                    attribute.value.decode_as().map_err(|e| {
+                        NameConstraintError::Parse(format!("subject emailAddress: {e}"))
+                    })?;
+                if email.as_str().is_empty() {
+                    return Err(NameConstraintError::Parse(
+                        "subject emailAddress must not be empty".into(),
+                    ));
+                }
+                names.push(AssertedName::Rfc822(email.as_str().to_ascii_lowercase()));
+            }
         }
     }
 
@@ -464,9 +497,8 @@ fn dns_matches(base: &str, name: &str) -> bool {
         && name.as_bytes()[name.len() - base.len() - 1] == b'.'
 }
 
-/// rfc822Name matching: a bare host (`host.example.com`) matches that mailbox
-/// host exactly; a domain (`example.com`) matches any mailbox in that domain or
-/// a sub-domain; a leading-dot form (`.example.com`) matches sub-domains only.
+/// rfc822Name matching: a bare host (`example.com`) matches that mailbox host
+/// exactly; a leading-dot form (`.example.com`) matches sub-domains only.
 fn rfc822_matches(base: &str, name: &str) -> bool {
     if base.is_empty() {
         return true;
@@ -486,11 +518,8 @@ fn rfc822_matches(base: &str, name: &str) -> bool {
         // Full mailbox constraint — exact (case-insensitive) match.
         return name == base;
     }
-    // A host or domain. Exact host match, or domain suffix on a label boundary.
+    // A constraint without a leading dot names an exact mail host.
     host == base
-        || (host.len() > base.len()
-            && host.ends_with(base)
-            && host.as_bytes()[host.len() - base.len() - 1] == b'.')
 }
 
 /// iPAddress constraint matching: `(name & mask) == (addr & mask)` for matching
@@ -730,6 +759,80 @@ fn inner_name_rdns(der: &[u8]) -> Result<Vec<Vec<u8>>, NameConstraintError> {
 mod tests {
     use super::*;
 
+    fn dns_constraint_value(names: &[&str], excluded: bool) -> Vec<u8> {
+        use crate::der_utils::{encode_sequence_raw, encode_tlv};
+
+        let mut subtrees = Vec::new();
+        for name in names {
+            subtrees.extend(encode_sequence_raw(&encode_tlv(GN_DNS, name.as_bytes())));
+        }
+        encode_sequence_raw(&encode_tlv(if excluded { 0xA1 } else { 0xA0 }, &subtrees))
+    }
+
+    #[test]
+    fn permitted_groups_intersect_across_issuers() {
+        for groups in [
+            ["example.test", "department.example.test"],
+            ["department.example.test", "example.test"],
+        ] {
+            let mut state = NameConstraintState::default();
+            for group in groups {
+                state
+                    .add_from_extension_value(&dns_constraint_value(&[group], false))
+                    .unwrap();
+            }
+            state
+                .check_name(&AssertedName::Dns("host.department.example.test".into()))
+                .expect("a name allowed by both issuers must be accepted");
+            assert!(matches!(
+                state.check_name(&AssertedName::Dns("other.example.test".into())),
+                Err(NameConstraintError::Violation(_))
+            ));
+            assert!(matches!(
+                state.check_name(&AssertedName::Dns("outside.test".into())),
+                Err(NameConstraintError::Violation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn permitted_alternatives_within_one_issuer_remain_a_union() {
+        let mut state = NameConstraintState::default();
+        state
+            .add_from_extension_value(&dns_constraint_value(
+                &["first.example.test", "second.example.test"],
+                false,
+            ))
+            .unwrap();
+        for name in ["host.first.example.test", "host.second.example.test"] {
+            state
+                .check_name(&AssertedName::Dns(name.into()))
+                .expect("either alternative from one issuer must permit the name");
+        }
+        state
+            .check_name(&AssertedName::Ip(vec![192, 0, 2, 1]))
+            .expect("a DNS-only permitted group must not constrain another name type");
+    }
+
+    #[test]
+    fn excluded_groups_remain_a_union_across_issuers() {
+        let mut state = NameConstraintState::default();
+        for group in ["first.example.test", "second.example.test"] {
+            state
+                .add_from_extension_value(&dns_constraint_value(&[group], true))
+                .unwrap();
+        }
+        for name in ["host.first.example.test", "host.second.example.test"] {
+            assert!(matches!(
+                state.check_name(&AssertedName::Dns(name.into())),
+                Err(NameConstraintError::Violation(_))
+            ));
+        }
+        state
+            .check_name(&AssertedName::Dns("other.example.test".into()))
+            .expect("names outside all excluded groups remain accepted");
+    }
+
     #[test]
     fn dns_label_boundary() {
         assert!(dns_matches("example.com", "host.example.com"));
@@ -744,7 +847,7 @@ mod tests {
     #[test]
     fn rfc822_rules() {
         assert!(rfc822_matches("example.com", "alice@example.com"));
-        assert!(rfc822_matches("example.com", "bob@sub.example.com"));
+        assert!(!rfc822_matches("example.com", "bob@sub.example.com"));
         assert!(!rfc822_matches("example.com", "bob@notexample.com"));
         assert!(rfc822_matches("host.example.com", "carol@host.example.com"));
         assert!(!rfc822_matches(
@@ -754,6 +857,119 @@ mod tests {
         assert!(rfc822_matches(".example.com", "dan@sub.example.com"));
         assert!(!rfc822_matches(".example.com", "dan@example.com"));
         assert!(rfc822_matches("alice@example.com", "alice@example.com"));
+    }
+
+    fn mail_constraint(base: &str, excluded: bool) -> NameConstraintState {
+        use crate::der_utils::{encode_sequence_raw, encode_tlv};
+
+        let subtree = encode_sequence_raw(&encode_tlv(GN_RFC822, base.as_bytes()));
+        let value = encode_sequence_raw(&encode_tlv(if excluded { 0xA1 } else { 0xA0 }, &subtree));
+        let mut state = NameConstraintState::default();
+        state.add_from_extension_value(&value).unwrap();
+        state
+    }
+
+    fn legacy_mail_certificate(tag: der::Tag, emails: &[&str], san: Option<&[u8]>) -> Certificate {
+        use der::Decode;
+        use x509_cert::attr::AttributeTypeAndValue;
+        use x509_cert::name::RelativeDistinguishedName;
+
+        let (_, cert_der) = pem_rfc7468::decode_vec(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/signer_cert.pem"
+        )))
+        .unwrap();
+        let mut cert = Certificate::from_der(&cert_der).unwrap();
+        for email in emails {
+            let attribute = AttributeTypeAndValue {
+                oid: const_oid::ObjectIdentifier::new_unwrap(EMAIL_ADDRESS_OID),
+                value: der::Any::new(tag, email.as_bytes()).unwrap(),
+            };
+            cert.tbs_certificate
+                .subject
+                .0
+                .push(RelativeDistinguishedName::try_from(vec![attribute]).unwrap());
+        }
+        let san_oid = const_oid::ObjectIdentifier::new_unwrap(SAN_OID);
+        let extensions = cert.tbs_certificate.extensions.get_or_insert_default();
+        extensions.retain(|ext| ext.extn_id != san_oid);
+        if let Some(value) = san {
+            extensions.push(x509_cert::ext::Extension {
+                extn_id: san_oid,
+                critical: false,
+                extn_value: der::asn1::OctetString::new(value).unwrap(),
+            });
+        }
+        cert
+    }
+
+    #[test]
+    fn legacy_subject_mail_is_constrained_without_san() {
+        let state = mail_constraint("example.test", false);
+        let allowed = legacy_mail_certificate(der::Tag::Ia5String, &["ALICE@EXAMPLE.TEST"], None);
+        state.check_cert(&allowed).unwrap();
+        for emails in [
+            vec!["bob@other.test"],
+            vec!["bob@sub.example.test"],
+            vec!["alice@example.test", "bob@other.test"],
+        ] {
+            let cert = legacy_mail_certificate(der::Tag::Ia5String, &emails, None);
+            assert!(matches!(
+                state.check_cert(&cert),
+                Err(NameConstraintError::Violation(_))
+            ));
+        }
+        let excluded = mail_constraint("example.test", true);
+        assert!(matches!(
+            excluded.check_cert(&allowed),
+            Err(NameConstraintError::Violation(_))
+        ));
+        let subdomain =
+            legacy_mail_certificate(der::Tag::Ia5String, &["alice@sub.example.test"], None);
+        excluded
+            .check_cert(&subdomain)
+            .expect("a bare excluded mail host must not exclude its subdomains");
+    }
+
+    #[test]
+    fn present_san_suppresses_legacy_subject_mail_fallback() {
+        use crate::der_utils::{encode_sequence_raw, encode_tlv};
+
+        let state = mail_constraint("example.test", false);
+        for (tag, value) in [
+            (GN_DNS, "host.example.test"),
+            (GN_RFC822, "alice@example.test"),
+        ] {
+            let san = encode_sequence_raw(&encode_tlv(tag, value.as_bytes()));
+            let cert =
+                legacy_mail_certificate(der::Tag::Ia5String, &["legacy@other.test"], Some(&san));
+            state
+                .check_cert(&cert)
+                .expect("any present SAN suppresses the legacy emailAddress fallback");
+        }
+        let san = encode_sequence_raw(&encode_tlv(GN_RFC822, b"bob@other.test"));
+        let cert =
+            legacy_mail_certificate(der::Tag::Ia5String, &["legacy@example.test"], Some(&san));
+        assert!(matches!(
+            state.check_cert(&cert),
+            Err(NameConstraintError::Violation(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_legacy_subject_mail_fails_closed_when_constrained() {
+        let state = mail_constraint("example.test", false);
+        for (tag, value) in [
+            (der::Tag::Utf8String, "alice@example.test"),
+            (der::Tag::Ia5String, "alícé@example.test"),
+            (der::Tag::Ia5String, ""),
+        ] {
+            let cert = legacy_mail_certificate(tag, &[value], None);
+            assert!(matches!(
+                state.check_cert(&cert),
+                Err(NameConstraintError::Parse(_))
+            ));
+        }
     }
 
     #[test]

@@ -26,6 +26,29 @@ struct CrlCacheEntry {
     der: Vec<u8>,
     /// When this entry was fetched.
     fetched_at: Instant,
+    /// Only structure-derived dates are cached, never an authorization decision.
+    validity: CrlValidity,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CrlValidity {
+    this_update: chrono::DateTime<chrono::Utc>,
+    next_update: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl CrlValidity {
+    fn from_der(der: &[u8]) -> Result<Self, LtvError> {
+        let parsed = parse_crl(der)?;
+        Ok(Self {
+            this_update: parsed.this_update,
+            next_update: parsed.next_update,
+        })
+    }
+
+    fn is_current(self, now: chrono::DateTime<chrono::Utc>, freshness: &CrlFreshness) -> bool {
+        now + freshness.clock_skew >= self.this_update
+            && validate_crl_dates(self.this_update, self.next_update, now, freshness).is_ok()
+    }
 }
 
 /// CRL client with in-memory caching.
@@ -61,6 +84,35 @@ pub struct CrlClient {
 
 /// Maximum allowed CRL response body size (10 MiB).
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+/// Bound retained DER and URL/entry overhead independently of per-body limits.
+const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CACHE_ENTRIES: usize = 64;
+
+fn insert_cache_entry(
+    cache: &mut HashMap<String, CrlCacheEntry>,
+    url: String,
+    entry: CrlCacheEntry,
+) {
+    // Long URLs and caller-increased body limits must not evade cache bounds.
+    if entry.der.len() > MAX_CACHE_BYTES || url.len() > 8192 {
+        return;
+    }
+    cache.remove(&url);
+    let mut bytes: usize = cache.values().map(|item| item.der.len()).sum();
+    while cache.len() >= MAX_CACHE_ENTRIES || bytes > MAX_CACHE_BYTES - entry.der.len() {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, item)| item.fetched_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        if let Some(removed) = cache.remove(&oldest) {
+            bytes -= removed.der.len();
+        }
+    }
+    cache.insert(url, entry);
+}
 
 /// Build the default CRL HTTP client with a bounded redirect policy that
 /// refuses to follow redirects to literal non-public addresses — complementing
@@ -135,10 +187,10 @@ impl CrlClient {
     /// attacker-controlled and can name `127.0.0.1`, `169.254.169.254`
     /// (cloud metadata), or an RFC 1918 host directly or via DNS.
     ///
-    /// Residual limitation: the host is resolved here while `reqwest` re-resolves
-    /// at connect time, so a DNS-rebinding attacker who flips the record between
-    /// the two lookups is not fully prevented. The default client's redirect
-    /// policy additionally refuses redirects to literal non-public addresses.
+    /// The default client's connection resolver checks the addresses actually
+    /// passed to reqwest, including redirect hostnames. Its redirect policy
+    /// additionally refuses literal non-public addresses. An injected unverified
+    /// client must supply equivalent transport controls.
     async fn validate_url(url: &str) -> Result<(), LtvError> {
         crate::net::validate_fetch_url(url)
             .await
@@ -194,25 +246,33 @@ impl CrlClient {
         // Check cache first. A cache hit performs no network egress, so the SSRF
         // guard (which resolves DNS) only needs to run on the fetch path below.
         {
-            let cache = self
+            let mut cache = self
                 .cache
                 .lock()
                 .map_err(|e| LtvError::Crl(format!("cache lock poisoned: {e}")))?;
             if let Some(entry) = cache.get(url) {
                 if entry.fetched_at.elapsed() < self.grace_period
-                    && crl_is_current(&entry.der, chrono::Utc::now(), freshness)
+                    && entry.validity.is_current(chrono::Utc::now(), freshness)
                 {
+                    if entry.der.len() > self.max_body_size {
+                        return Err(LtvError::Crl("cached CRL exceeds max body size".into()));
+                    }
                     log::debug!("CRL cache hit for {url}");
                     return Ok(entry.der.clone());
                 }
                 log::debug!("CRL cache entry for {url} is stale or expired; re-fetching");
             }
+            cache.remove(url);
         }
 
         // Validate scheme *and* that the host resolves to a public address
         // before any network egress (SSRF guard). A certificate's CRL
         // distribution point URL is attacker-controlled.
-        Self::validate_url(url).await?;
+        tokio::time::timeout(self.timeout, Self::validate_url(url))
+            .await
+            .map_err(|_| {
+                LtvError::Crl(format!("URL validation timed out after {:?}", self.timeout))
+            })??;
 
         log::debug!("Fetching CRL from {url}");
 
@@ -253,7 +313,7 @@ impl CrlClient {
                 .await
                 .map_err(|e| LtvError::Crl(format!("failed to read CRL response body: {e}")))?;
             let Some(chunk) = chunk else { break };
-            if crl_bytes.len() + chunk.len() > self.max_body_size {
+            if chunk.len() > self.max_body_size.saturating_sub(crl_bytes.len()) {
                 return Err(LtvError::Crl(format!(
                     "CRL from {url} exceeds max body size (> {})",
                     self.max_body_size
@@ -271,17 +331,20 @@ impl CrlClient {
 
         log::debug!("CRL from {url}: {} bytes", crl_bytes.len());
 
-        // Update cache
-        {
+        // Cache only fully parsed structure. Signature/issuer/freshness policy
+        // remains checked by the authoritative revocation pipeline on every use.
+        if let Ok(validity) = CrlValidity::from_der(&crl_bytes) {
             let mut cache = self
                 .cache
                 .lock()
                 .map_err(|e| LtvError::Crl(format!("cache lock poisoned: {e}")))?;
-            cache.insert(
+            insert_cache_entry(
+                &mut cache,
                 url.to_string(),
                 CrlCacheEntry {
                     der: crl_bytes.clone(),
                     fetched_at: Instant::now(),
+                    validity,
                 },
             );
         }
@@ -498,6 +561,50 @@ fn extensions_contain_oid(extensions_body: &[u8], target_oid: &[u8]) -> Result<b
     Ok(false)
 }
 
+/// Unknown critical CRL/entry extensions can change completeness or scope.
+/// This implementation accepts complete direct CRLs only.
+fn validate_crl_extensions(encoded: &[u8]) -> Result<(), LtvError> {
+    use der::Decode;
+    let extensions = x509_cert::ext::Extensions::from_der(encoded)
+        .map_err(|e| LtvError::Crl(format!("CRL extensions: {e}")))?;
+    if extensions.is_empty() {
+        return Err(LtvError::Crl("empty CRL Extensions sequence".into()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for extension in extensions {
+        if !seen.insert(extension.extn_id) {
+            return Err(LtvError::Crl("duplicate CRL extension".into()));
+        }
+        if extension.critical {
+            return Err(LtvError::Crl(format!(
+                "unsupported critical CRL extension {}",
+                extension.extn_id
+            )));
+        }
+        if extension.extn_id == const_oid::ObjectIdentifier::new_unwrap("2.5.29.29") {
+            return Err(LtvError::Crl(
+                "indirect CRL certificateIssuer extension is unsupported".into(),
+            ));
+        }
+        if extension.extn_id == const_oid::ObjectIdentifier::new_unwrap("2.5.29.21") {
+            let (tag, value, rest) =
+                parse_tlv_with_rest(extension.extn_value.as_bytes()).map_err(LtvError::Crl)?;
+            if tag != 0x0a
+                || value.len() != 1
+                || !rest.is_empty()
+                || value[0] > 10
+                || value[0] == 7
+                || value[0] == 8
+            {
+                return Err(LtvError::Crl(
+                    "invalid or unsupported full-CRL reason code".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse a DER-encoded CRL into its structural components.
 ///
 /// ```text
@@ -519,8 +626,11 @@ fn extensions_contain_oid(extensions_body: &[u8], target_oid: &[u8]) -> Result<b
 /// ```
 pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
     // Outer SEQUENCE: CertificateList
-    let (outer_tag, outer_body) =
-        parse_tlv(crl_der).map_err(|e| LtvError::Crl(format!("CRL outer SEQUENCE: {e}")))?;
+    let (outer_tag, outer_body, outer_rest) = parse_tlv_with_rest(crl_der)
+        .map_err(|e| LtvError::Crl(format!("CRL outer SEQUENCE: {e}")))?;
+    if !outer_rest.is_empty() {
+        return Err(LtvError::Crl("trailing data after CRL".into()));
+    }
     if outer_tag != 0x30 {
         return Err(LtvError::Crl(format!(
             "expected CRL SEQUENCE (0x30), got 0x{outer_tag:02x}"
@@ -528,7 +638,7 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
     }
 
     // Parse the three children: tbsCertList, signatureAlgorithm, signatureValue
-    let (tbs_tag, tbs_value, rest) = parse_tlv_with_rest(&outer_body)
+    let (tbs_tag, tbs_value, rest) = parse_tlv_with_rest(outer_body)
         .map_err(|e| LtvError::Crl(format!("CRL tbsCertList: {e}")))?;
     if tbs_tag != 0x30 {
         return Err(LtvError::Crl(format!(
@@ -557,16 +667,21 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
         .map_err(|e| LtvError::Crl(format!("CRL signatureAlgorithm decode: {e}")))?;
 
     // signatureValue BIT STRING
-    let (sig_val_tag, sig_val_body, _) =
+    let (sig_val_tag, sig_val_body, after_signature) =
         parse_tlv_with_rest(rest).map_err(|e| LtvError::Crl(format!("CRL sigValue: {e}")))?;
+    if !after_signature.is_empty() {
+        return Err(LtvError::Crl("trailing fields after CRL signature".into()));
+    }
     if sig_val_tag != 0x03 {
         return Err(LtvError::Crl(format!(
             "expected signatureValue BIT STRING (0x03), got 0x{sig_val_tag:02x}"
         )));
     }
     // BIT STRING: first byte is unused-bits count (should be 0)
-    if sig_val_body.is_empty() {
-        return Err(LtvError::Crl("empty signature BIT STRING".into()));
+    if sig_val_body.len() < 2 || sig_val_body[0] != 0 {
+        return Err(LtvError::Crl(
+            "signature BIT STRING must contain octet-aligned signature bytes".into(),
+        ));
     }
     let signature_bytes = sig_val_body[1..].to_vec();
 
@@ -580,19 +695,31 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
         // and v1 CRLs might omit it. The next field after optional version
         // is a SEQUENCE (AlgorithmIdentifier). Let's peek:
         // If we see INTEGER, skip it as version.
-        let (_, _, r) =
+        let (_, version, r) =
             parse_tlv_with_rest(tbs_pos).map_err(|e| LtvError::Crl(format!("CRL version: {e}")))?;
+        if version != [1] {
+            return Err(LtvError::Crl("explicit CRL version must be v2 (1)".into()));
+        }
         tbs_pos = r;
     }
 
-    // signature AlgorithmIdentifier (SEQUENCE) — skip, we got it from outer
-    if !tbs_pos.is_empty() {
-        let (tag, _, r) = parse_tlv_with_rest(tbs_pos)
-            .map_err(|e| LtvError::Crl(format!("CRL inner sigAlg: {e}")))?;
-        if tag == 0x30 {
-            tbs_pos = r;
-        }
+    // Bind the signed inner AlgorithmIdentifier to the outer declaration.
+    let (tag, _, r) = parse_tlv_with_rest(tbs_pos)
+        .map_err(|e| LtvError::Crl(format!("CRL inner sigAlg: {e}")))?;
+    if tag != 0x30 {
+        return Err(LtvError::Crl(
+            "CRL inner signatureAlgorithm is not a SEQUENCE".into(),
+        ));
     }
+    let inner_algorithm =
+        spki::AlgorithmIdentifierOwned::from_der(&tbs_pos[..tbs_pos.len() - r.len()])
+            .map_err(|e| LtvError::Crl(format!("CRL inner signatureAlgorithm: {e}")))?;
+    if inner_algorithm != signature_algorithm {
+        return Err(LtvError::Crl(
+            "CRL inner and outer signatureAlgorithm differ".into(),
+        ));
+    }
+    tbs_pos = r;
 
     // issuer Name (SEQUENCE)
     let (issuer_tag, _issuer_body, rest_after_issuer) =
@@ -643,12 +770,18 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
         // `Extensions ::= SEQUENCE OF Extension` TLV; unwrap it so the OID scan
         // iterates over the individual Extension entries rather than seeing the
         // wrapping SEQUENCE as a single (OID-less) extension.
-        let (wrap_tag, wrap_body, _) = parse_tlv_with_rest(tbs_pos)
+        let (wrap_tag, wrap_body, after_extensions) = parse_tlv_with_rest(tbs_pos)
             .map_err(|e| LtvError::Crl(format!("crlExtensions: {e}")))?;
+        if !after_extensions.is_empty() {
+            return Err(LtvError::Crl("trailing fields after crlExtensions".into()));
+        }
         // tbs_pos[0] == 0xA0 was checked above, so wrap_tag is 0xA0.
         debug_assert_eq!(wrap_tag, 0xA0);
-        let (seq_tag, extensions_body, _) = parse_tlv_with_rest(wrap_body)
+        let (seq_tag, extensions_body, after_sequence) = parse_tlv_with_rest(wrap_body)
             .map_err(|e| LtvError::Crl(format!("crlExtensions SEQUENCE: {e}")))?;
+        if !after_sequence.is_empty() {
+            return Err(LtvError::Crl("trailing data inside crlExtensions".into()));
+        }
         // The [0] body must be an Extensions SEQUENCE. Anything else is
         // malformed and must be rejected (fail closed), not silently skipped —
         // otherwise a bogus wrapper would bypass delta/partitioned detection.
@@ -680,6 +813,13 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
                 "partitioned CRL (IssuingDistributionPoint) not supported; only full CRLs are accepted".into(),
             ));
         }
+        validate_crl_extensions(wrap_body)?;
+        tbs_pos = after_extensions;
+    }
+    if !tbs_pos.is_empty() {
+        return Err(LtvError::Crl(
+            "unexpected trailing TBSCertList fields".into(),
+        ));
     }
 
     Ok(ParsedCrl {
@@ -733,6 +873,9 @@ fn parse_revoked_certificates(
             .map_err(|e| LtvError::Crl(format!("revocation date parse: {e}")))?;
 
         // crlEntryExtensions OPTIONAL — look for reason code
+        if !entry_rest2.is_empty() {
+            validate_crl_extensions(entry_rest2)?;
+        }
         let reason = parse_revocation_reason(entry_rest2);
 
         entries.push(RevokedEntry {
@@ -839,6 +982,18 @@ pub fn verify_crl_signature_with_policy(
         .to_der()
         .map_err(|e| LtvError::Crl(format!("issuer SPKI encode failed: {e}")))?;
 
+    if issuer
+        .tbs_certificate
+        .subject
+        .to_der()
+        .map_err(|e| LtvError::Crl(format!("CRL signer name: {e}")))?
+        != parsed_crl.issuer_der
+    {
+        return Err(LtvError::Crl(
+            "CRL issuer does not match signing certificate subject".into(),
+        ));
+    }
+
     crate::crypto::verify::verify_signature_by_algid_with_policy(
         &parsed_crl.tbs_bytes,
         &parsed_crl.signature_bytes,
@@ -919,15 +1074,24 @@ fn validate_crl_freshness(
     now: chrono::DateTime<chrono::Utc>,
     freshness: &CrlFreshness,
 ) -> Result<(), LtvError> {
+    validate_crl_dates(parsed.this_update, parsed.next_update, now, freshness)
+}
+
+fn validate_crl_dates(
+    this_update: chrono::DateTime<chrono::Utc>,
+    next_update: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    freshness: &CrlFreshness,
+) -> Result<(), LtvError> {
     let skew = freshness.clock_skew;
 
-    match parsed.next_update {
+    match next_update {
         Some(next_update) => {
             // Sanity: a window that ends before it starts is malformed.
-            if next_update < parsed.this_update {
+            if next_update < this_update {
                 return Err(LtvError::Crl(format!(
                     "CRL has nextUpdate ({next_update}) before thisUpdate ({})",
-                    parsed.this_update
+                    this_update
                 )));
             }
             // Anti-replay: reject once the validation instant is past nextUpdate.
@@ -943,11 +1107,11 @@ fn validate_crl_freshness(
             // No nextUpdate: bound the CRL's age from thisUpdate so an old CRL
             // cannot be relied on indefinitely. A CRL whose window starts at/after
             // the validation time is always within bound.
-            let max_valid = parsed.this_update + freshness.max_age_without_next_update + skew;
+            let max_valid = this_update + freshness.max_age_without_next_update + skew;
             if now > max_valid {
                 return Err(LtvError::Crl(format!(
                     "CRL without nextUpdate is too old: thisUpdate ({}), validation time ({now}), max age {}",
-                    parsed.this_update, freshness.max_age_without_next_update
+                    this_update, freshness.max_age_without_next_update
                 )));
             }
         }
@@ -1139,6 +1303,48 @@ mod tests {
         encode_integer_u64, encode_sequence_from_parts, encode_sequence_raw, encode_tlv,
     };
     use der::{Decode, Encode};
+
+    #[tokio::test]
+    #[ignore = "local performance measurement"]
+    async fn local_crl_cache_performance() {
+        let issuer = intermediate_ca_cert();
+        let key = std::fs::read_to_string(intermediate_ca_key_pem()).unwrap();
+        let entries: Vec<_> = (1_u64..=1000)
+            .map(|serial| {
+                let encoded = encode_integer_u64(serial);
+                let (_, body, _) = parse_tlv_with_rest(&encoded).unwrap();
+                (body.to_vec(), "200101000000Z")
+            })
+            .collect();
+        let der = build_test_crl_with_window(
+            &issuer,
+            &key,
+            &entries,
+            "200101000000Z",
+            Some("490101000000Z"),
+        );
+        let client = CrlClient::new().unwrap();
+        let url = "http://fixture.invalid/large.crl";
+        client.cache.lock().unwrap().insert(
+            url.into(),
+            CrlCacheEntry {
+                validity: CrlValidity::from_der(&der).unwrap(),
+                der: der.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let started = Instant::now();
+            for _ in 0..100 {
+                std::hint::black_box(client.fetch_crl(url).await.unwrap());
+            }
+            samples.push(started.elapsed().as_nanos() / 100);
+        }
+        samples.sort_unstable();
+        println!("crl_cache_hit_1000_entries: median={} ns/op, range={}..{}, bytes={}, iterations=100, samples=7",
+            samples[3], samples[0], samples[6], der.len());
+    }
 
     #[test]
     fn test_crl_client_default() {
@@ -1933,6 +2139,7 @@ mod tests {
         client.cache.lock().unwrap().insert(
             url.to_string(),
             CrlCacheEntry {
+                validity: CrlValidity::from_der(&der).unwrap(),
                 der: der.clone(),
                 fetched_at: Instant::now(),
             },
@@ -1961,10 +2168,11 @@ mod tests {
         let client = CrlClient::new()
             .unwrap()
             .timeout(Duration::from_millis(200));
-        let url = "http://crl.invalid.example/stale.crl";
+        let url = "http://127.0.0.1/stale.crl";
         client.cache.lock().unwrap().insert(
             url.to_string(),
             CrlCacheEntry {
+                validity: CrlValidity::from_der(&stale).unwrap(),
                 der: stale,
                 fetched_at: Instant::now(), // within grace period
             },
@@ -1975,6 +2183,137 @@ mod tests {
             res.is_err(),
             "stale cache entry must not be served; expected a (failed) re-fetch"
         );
+    }
+
+    #[test]
+    fn crl_schema_and_algorithm_binding_are_strict() {
+        let der = build_crl_with_extension(&[0x55, 0x1d, 0x14]);
+        let mut trailing = der.clone();
+        trailing.extend_from_slice(&[0x05, 0x00]);
+        assert!(parse_crl(&trailing).is_err());
+        let mut crl = x509_cert::crl::CertificateList::from_der(&der).unwrap();
+        crl.signature_algorithm.oid =
+            const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
+        assert!(parse_crl(&crl.to_der().unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("differ"));
+        crl.signature_algorithm = crl.tbs_cert_list.signature.clone();
+        crl.signature = der::asn1::BitString::new(1, vec![0x80]).unwrap();
+        assert!(parse_crl(&crl.to_der().unwrap()).is_err());
+    }
+
+    #[test]
+    fn crl_extensions_reject_ambiguous_or_unsupported_semantics() {
+        use der::asn1::OctetString;
+        use x509_cert::ext::Extension;
+        let extension = Extension {
+            extn_id: const_oid::ObjectIdentifier::new_unwrap("1.2.3.4"),
+            critical: true,
+            extn_value: OctetString::new(vec![0x05, 0]).unwrap(),
+        };
+        assert!(validate_crl_extensions(&vec![extension.clone()].to_der().unwrap()).is_err());
+        let mut benign = extension.clone();
+        benign.critical = false;
+        assert!(validate_crl_extensions(&vec![benign.clone()].to_der().unwrap()).is_ok());
+        assert!(validate_crl_extensions(&vec![benign.clone(), benign].to_der().unwrap()).is_err());
+        let mut indirect = extension;
+        indirect.critical = false;
+        indirect.extn_id = const_oid::ObjectIdentifier::new_unwrap("2.5.29.29");
+        assert!(validate_crl_extensions(&vec![indirect].to_der().unwrap()).is_err());
+        assert!(validate_crl_extensions(&[0x30, 0]).is_err());
+    }
+
+    #[test]
+    fn cached_dates_preserve_freshness_policy_and_parse_failures() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let validity = CrlValidity {
+            this_update: now - chrono::Duration::hours(48),
+            next_update: None,
+        };
+        assert!(!validity.is_current(now, &CrlFreshness::default()));
+        let relaxed = CrlFreshness {
+            max_age_without_next_update: chrono::Duration::hours(72),
+            ..CrlFreshness::default()
+        };
+        assert!(validity.is_current(now, &relaxed));
+        let future = CrlValidity {
+            this_update: now + chrono::Duration::hours(1),
+            next_update: None,
+        };
+        assert!(!future.is_current(now, &relaxed));
+        assert!(CrlValidity::from_der(&[0x30, 0]).is_err());
+    }
+
+    #[tokio::test]
+    async fn cached_body_obeys_limit_of_each_client_clone() {
+        let der = build_crl_with_extension(&[0x55, 0x1d, 0x14]);
+        let client = CrlClient::new().unwrap();
+        let url = "http://127.0.0.1/cached.crl";
+        insert_cache_entry(
+            &mut client.cache.lock().unwrap(),
+            url.into(),
+            CrlCacheEntry {
+                validity: CrlValidity::from_der(&der).unwrap(),
+                der: der.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+        let small = client.clone().max_body_size(der.len() - 1);
+        assert!(small
+            .fetch_crl(url)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("max body size"));
+        assert_eq!(client.fetch_crl(url).await.unwrap(), der);
+        // Expired cache grace must refresh rather than fail on an old body's
+        // size. The loopback URL guard proves this path without any egress.
+        let error = small
+            .grace_period(Duration::ZERO)
+            .fetch_crl(url)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("URL rejected"));
+        assert!(client.cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_retention_is_bounded_by_count_and_bytes() {
+        let validity = CrlValidity {
+            this_update: chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            next_update: None,
+        };
+        let mut cache = HashMap::new();
+        for i in 0..MAX_CACHE_ENTRIES + 10 {
+            insert_cache_entry(
+                &mut cache,
+                format!("fixture-{i}"),
+                CrlCacheEntry {
+                    der: vec![0; 4],
+                    fetched_at: Instant::now(),
+                    validity,
+                },
+            );
+        }
+        assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
+        cache.clear();
+        for i in 0..3 {
+            insert_cache_entry(
+                &mut cache,
+                format!("large-{i}"),
+                CrlCacheEntry {
+                    der: vec![0; MAX_CACHE_BYTES / 2 + 1],
+                    fetched_at: Instant::now(),
+                    validity,
+                },
+            );
+        }
+        assert!(cache.values().map(|entry| entry.der.len()).sum::<usize>() <= MAX_CACHE_BYTES);
     }
 
     #[test]
