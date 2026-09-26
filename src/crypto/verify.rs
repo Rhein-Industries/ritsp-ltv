@@ -28,9 +28,9 @@
 //!
 //! - [`crate::trust::TrustStore::allow_legacy_signatures`] — certificate-chain
 //!   verification (including the TSA certificate chain reached by
-//!   [`crate::tsp::verify_timestamp_token`]).
-//! - [`crate::ltv::RevocationConfig::allow_legacy_signatures`] — OCSP response
-//!   and CRL signatures.
+//!   `crate::tsp::verify_timestamp_token` when the `tsp` feature is enabled).
+//! - `crate::ltv::RevocationConfig::allow_legacy_signatures` — OCSP response
+//!   and CRL signatures when the `ltv` feature is enabled.
 //! - The `*_with_policy` free functions here — for direct callers.
 //!
 //! The RFC 3161 token's own CMS `SignerInfo` signature is always verified
