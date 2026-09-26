@@ -20,7 +20,7 @@
 //! match the expected profile for the given [`CertRole`]:
 //!
 //! - **EndEntity**: must NOT have `CA:TRUE`; should have `digitalSignature` key usage
-//! - **IntermediateCa**: must have `CA:TRUE` + `keyCertSign` key usage
+//! - **IntermediateCa**: must have `CA:TRUE`; a present KU must permit keyCertSign
 //! - **CrlSigner**: must have `cRLSign` key usage
 //! - **OcspResponder**: must have `id-kp-OCSPSigning` EKU
 //! - **TimestampSigner**: must not assert `basicConstraints cA:TRUE` (an absent
@@ -186,7 +186,7 @@ impl std::fmt::Display for CertRole {
 pub fn check_basic_constraints(cert: &Certificate) -> Result<(bool, Option<u32>), LtvError> {
     let bc_oid = const_oid::ObjectIdentifier::new_unwrap(BASIC_CONSTRAINTS_OID);
 
-    let ext_value = match find_extension_value(cert, &bc_oid) {
+    let ext_value = match find_extension_value(cert, &bc_oid)? {
         Some(v) => v,
         None => return Ok((false, None)),
     };
@@ -221,14 +221,19 @@ pub fn check_basic_constraints(cert: &Certificate) -> Result<(bool, Option<u32>)
 pub fn check_key_usage(cert: &Certificate) -> Result<Option<KeyUsageBits>, LtvError> {
     let ku_oid = const_oid::ObjectIdentifier::new_unwrap(KEY_USAGE_OID);
 
-    let ext_value = match find_extension_value(cert, &ku_oid) {
+    let ext_value = match find_extension_value(cert, &ku_oid)? {
         Some(v) => v,
         None => return Ok(None),
     };
 
     // Parse BIT STRING (tag 0x03)
-    let (tag, bs_body) = der_utils::parse_tlv(ext_value)
+    let (tag, bs_body, rest) = der_utils::parse_tlv_with_rest(ext_value)
         .map_err(|e| LtvError::X509Extension(format!("keyUsage: {e}")))?;
+    if !rest.is_empty() {
+        return Err(LtvError::X509Extension(
+            "keyUsage: trailing data after BIT STRING".into(),
+        ));
+    }
     if tag != 0x03 {
         return Err(LtvError::X509Extension(format!(
             "keyUsage: expected BIT STRING (0x03), got 0x{tag:02x}"
@@ -240,8 +245,26 @@ pub fn check_key_usage(cert: &Certificate) -> Result<Option<KeyUsageBits>, LtvEr
     }
 
     // First byte = number of unused bits in the last content byte
-    let _unused_bits = bs_body[0];
+    let unused_bits = bs_body[0];
+    if unused_bits > 7 {
+        return Err(LtvError::X509Extension(format!(
+            "keyUsage: invalid unused-bits count {unused_bits} (must be 0..=7)"
+        )));
+    }
     let bit_bytes = &bs_body[1..];
+    if bit_bytes.is_empty() || bit_bytes.iter().all(|byte| *byte == 0) {
+        return Err(LtvError::X509Extension(
+            "keyUsage: BIT STRING must assert at least one key-usage bit".into(),
+        ));
+    }
+    if unused_bits > 0 {
+        let pad_mask = (1u8 << unused_bits) - 1;
+        if bit_bytes[bit_bytes.len() - 1] & pad_mask != 0 {
+            return Err(LtvError::X509Extension(
+                "keyUsage: BIT STRING has non-zero unused bits".into(),
+            ));
+        }
+    }
 
     // Helper: check if bit N is set (MSB-first within each byte)
     let bit_set = |n: usize| -> bool {
@@ -283,7 +306,7 @@ pub fn check_extended_key_usage(
 ) -> Result<Vec<const_oid::ObjectIdentifier>, LtvError> {
     let eku_oid = const_oid::ObjectIdentifier::new_unwrap(EKU_OID);
 
-    let ext_value = match find_extension_value(cert, &eku_oid) {
+    let ext_value = match find_extension_value(cert, &eku_oid)? {
         Some(v) => v,
         None => return Ok(Vec::new()),
     };
@@ -324,7 +347,10 @@ pub fn check_extended_key_usage(
 /// This only checks for the extension's presence — it does not parse
 /// or validate the extension's value.
 pub fn has_extension(cert: &Certificate, oid: &const_oid::ObjectIdentifier) -> bool {
-    find_extension_value(cert, oid).is_some()
+    cert.tbs_certificate
+        .extensions
+        .as_ref()
+        .is_some_and(|extensions| extensions.iter().any(|ext| ext.extn_id == *oid))
 }
 
 /// Validate that a certificate's extensions match the expected profile
@@ -335,17 +361,29 @@ pub fn has_extension(cert: &Certificate, oid: &const_oid::ObjectIdentifier) -> b
 /// | Role | Basic Constraints | Key Usage | EKU |
 /// |------|-------------------|-----------|-----|
 /// | EndEntity | CA must be FALSE | digitalSignature (warning if missing) | — |
-/// | IntermediateCa | CA must be TRUE | keyCertSign required | — |
+/// | IntermediateCa | CA must be TRUE | keyCertSign if present | — |
 /// | CrlSigner | — | cRLSign required | — |
 /// | OcspResponder | — | — | id-kp-OCSPSigning required |
-/// | TimestampSigner | CA must not be TRUE (absent OK) | — | critical id-kp-timeStamping required |
+/// | TimestampSigner | CA must not be TRUE (absent OK) | signing if present | exclusive critical id-kp-timeStamping required |
 ///
 /// # Errors
 ///
 /// Returns `LtvError::X509Extension` if:
 /// - A required extension is missing or has wrong value
 /// - Extension parsing fails
+/// - An extension OID occurs more than once
 pub fn validate_extensions_for_role(cert: &Certificate, role: CertRole) -> Result<(), LtvError> {
+    if let Some(extensions) = &cert.tbs_certificate.extensions {
+        let mut seen = std::collections::HashSet::with_capacity(extensions.len());
+        for ext in extensions {
+            if !seen.insert(ext.extn_id) {
+                return Err(LtvError::X509Extension(format!(
+                    "duplicate extension {}",
+                    ext.extn_id
+                )));
+            }
+        }
+    }
     match role {
         CertRole::EndEntity => validate_end_entity(cert),
         CertRole::IntermediateCa => validate_intermediate_ca(cert),
@@ -358,17 +396,22 @@ pub fn validate_extensions_for_role(cert: &Certificate, role: CertRole) -> Resul
 // ── Private helpers ───────────────────────────────────────────────
 
 /// Find the raw extension value (extnValue OCTET STRING content) for
-/// the given OID. Returns `None` if not found.
+/// the given OID. Returns `None` if not found and rejects repeated OIDs.
 fn find_extension_value<'a>(
     cert: &'a Certificate,
     oid: &const_oid::ObjectIdentifier,
-) -> Option<&'a [u8]> {
-    cert.tbs_certificate
-        .extensions
-        .as_ref()?
-        .iter()
-        .find(|ext| ext.extn_id == *oid)
-        .map(|ext| ext.extn_value.as_bytes())
+) -> Result<Option<&'a [u8]>, LtvError> {
+    let Some(extensions) = &cert.tbs_certificate.extensions else {
+        return Ok(None);
+    };
+    let mut matches = extensions.iter().filter(|ext| ext.extn_id == *oid);
+    let value = matches.next().map(|ext| ext.extn_value.as_bytes());
+    if matches.next().is_some() {
+        return Err(LtvError::X509Extension(format!(
+            "duplicate extension {oid}"
+        )));
+    }
+    Ok(value)
 }
 
 /// Validate end-entity certificate extensions.
@@ -404,19 +447,13 @@ fn validate_intermediate_ca(cert: &Certificate) -> Result<(), LtvError> {
         ));
     }
 
-    // Key usage: keyCertSign must be set
-    match check_key_usage(cert)? {
-        Some(ku) => {
-            if !ku.key_cert_sign {
-                return Err(LtvError::X509Extension(format!(
-                    "IntermediateCa certificate missing keyCertSign key usage (has: {ku})"
-                )));
-            }
-        }
-        None => {
-            return Err(LtvError::X509Extension(
-                "IntermediateCa certificate missing keyUsage extension".into(),
-            ));
+    // A present keyUsage restricts certificate signing; absence imposes no
+    // restriction, consistent with TrustStore's all-feature path validator.
+    if let Some(ku) = check_key_usage(cert)? {
+        if !ku.key_cert_sign {
+            return Err(LtvError::X509Extension(format!(
+                "IntermediateCa certificate missing keyCertSign key usage (has: {ku})"
+            )));
         }
     }
 
@@ -470,6 +507,9 @@ fn validate_timestamp_signer(cert: &Certificate) -> Result<(), LtvError> {
         ));
     }
 
+    crate::tsp::token::require_timestamp_signing_key_usage(cert)
+        .map_err(|e| LtvError::X509Extension(format!("TimestampSigner: {e}")))?;
+
     let eku_oid = const_oid::ObjectIdentifier::new_unwrap(EKU_OID);
     let ts_oid = const_oid::ObjectIdentifier::new_unwrap(TIMESTAMPING_EKU_OID);
 
@@ -491,7 +531,7 @@ fn validate_timestamp_signer(cert: &Certificate) -> Result<(), LtvError> {
     }
 
     let ekus = check_extended_key_usage(cert)?;
-    if !ekus.contains(&ts_oid) {
+    if ekus.as_slice() != [ts_oid] {
         return Err(LtvError::X509Extension(format!(
             "TimestampSigner certificate missing id-kp-timeStamping EKU (has: {})",
             if ekus.is_empty() {
@@ -628,6 +668,62 @@ mod tests {
         assert!(!ku.key_cert_sign, "signer should not have keyCertSign");
     }
 
+    fn cert_with_key_usage(value: &[u8]) -> Certificate {
+        let mut cert = intermediate_cert();
+        let ku_oid = const_oid::ObjectIdentifier::new_unwrap(KEY_USAGE_OID);
+        let ext = cert
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|ext| ext.extn_id == ku_oid)
+            .unwrap();
+        ext.extn_value = der::asn1::OctetString::new(value).unwrap();
+        cert
+    }
+
+    #[test]
+    fn test_key_usage_rejects_malformed_bit_strings_for_roles() {
+        // These synthetic extension values must be rejected before a role can
+        // interpret any asserted usage bit. No signature verification is needed
+        // to exercise the extension-profile boundary.
+        let malformed: &[&[u8]] = &[
+            &[0x03, 0x00],                   // no unused-bits octet
+            &[0x03, 0x01, 0x00],             // no content octets
+            &[0x03, 0x02, 0x00, 0x00],       // no usage bits asserted
+            &[0x03, 0x02, 0x08, 0x02],       // invalid unused-bits count
+            &[0x03, 0x02, 0xff, 0x02],       // invalid unused-bits count
+            &[0x03, 0x02, 0x06, 0x02],       // cRLSign falls in unused padding
+            &[0x03, 0x02, 0x01, 0x03],       // non-zero unused padding
+            &[0x03, 0x02, 0x01, 0x02, 5, 0], // trailing NULL
+        ];
+        for value in malformed {
+            let cert = cert_with_key_usage(value);
+            assert!(
+                check_key_usage(&cert).is_err(),
+                "malformed keyUsage must be rejected: {value:?}"
+            );
+            assert!(
+                validate_extensions_for_role(&cert, CertRole::CrlSigner).is_err(),
+                "malformed keyUsage must not authorize a CRL signer: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_key_usage_accepts_valid_padding_and_ninth_bit() {
+        let cert = cert_with_key_usage(&[0x03, 0x02, 0x01, 0x02]);
+        let ku = check_key_usage(&cert).unwrap().unwrap();
+        assert!(ku.crl_sign);
+        validate_extensions_for_role(&cert, CertRole::CrlSigner).unwrap();
+
+        let cert = cert_with_key_usage(&[0x03, 0x03, 0x07, 0x00, 0x80]);
+        let ku = check_key_usage(&cert).unwrap().unwrap();
+        assert!(ku.decipher_only);
+        assert!(!ku.crl_sign);
+    }
+
     // ── check_extended_key_usage ──────────────────────────────────
 
     #[test]
@@ -690,12 +786,29 @@ mod tests {
 
     #[test]
     fn test_validate_intermediate_ca() {
-        let cert = intermediate_cert();
+        let mut cert = intermediate_cert();
         let result = validate_extensions_for_role(&cert, CertRole::IntermediateCa);
         assert!(
             result.is_ok(),
             "intermediate CA cert should pass IntermediateCa validation: {result:?}"
         );
+        let ku_oid = const_oid::ObjectIdentifier::new_unwrap("2.5.29.15");
+        cert.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .retain(|ext| ext.extn_id != ku_oid);
+        assert!(validate_extensions_for_role(&cert, CertRole::IntermediateCa).is_ok());
+        cert.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(x509_cert::ext::Extension {
+                extn_id: ku_oid,
+                critical: true,
+                extn_value: der::asn1::OctetString::new([0x03, 0x02, 0x07, 0x80]).unwrap(),
+            });
+        assert!(validate_extensions_for_role(&cert, CertRole::IntermediateCa).is_err());
     }
 
     #[test]
@@ -726,6 +839,68 @@ mod tests {
             result.is_err(),
             "signer cert (no cRLSign) should fail CrlSigner validation"
         );
+    }
+
+    #[test]
+    fn test_roles_reject_duplicate_extensions_regardless_of_criticality() {
+        for critical in [false, true] {
+            let mut cert = intermediate_cert();
+            let extensions = cert.tbs_certificate.extensions.as_mut().unwrap();
+            let mut repeated = extensions
+                .iter()
+                .find(|ext| ext.extn_id.to_string() == KEY_USAGE_OID)
+                .unwrap()
+                .clone();
+            repeated.critical = critical;
+            extensions.push(repeated);
+            assert!(
+                check_key_usage(&cert).is_err(),
+                "direct keyUsage inspection must reject duplicates too"
+            );
+            for role in [
+                CertRole::EndEntity,
+                CertRole::IntermediateCa,
+                CertRole::CrlSigner,
+                CertRole::OcspResponder,
+                CertRole::TimestampSigner,
+            ] {
+                let err = validate_extensions_for_role(&cert, role)
+                    .expect_err("every role must reject an ambiguous extension set");
+                assert!(
+                    matches!(err, LtvError::X509Extension(ref m) if m.contains("duplicate extension")),
+                    "expected duplicate-extension rejection for {role}, got: {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_extension_helpers_reject_duplicate_requested_oids() {
+        let mut cert = intermediate_cert();
+        let extensions = cert.tbs_certificate.extensions.as_mut().unwrap();
+        for oid in [BASIC_CONSTRAINTS_OID, KEY_USAGE_OID] {
+            let repeated = extensions
+                .iter()
+                .find(|ext| ext.extn_id.to_string() == oid)
+                .unwrap()
+                .clone();
+            extensions.push(repeated);
+        }
+        let eku = x509_cert::ext::Extension {
+            extn_id: const_oid::ObjectIdentifier::new_unwrap(EKU_OID),
+            critical: false,
+            // SEQUENCE OF id-kp-timeStamping.
+            extn_value: der::asn1::OctetString::new([
+                0x30, 0x0a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08,
+            ])
+            .unwrap(),
+        };
+        extensions.push(eku.clone());
+        extensions.push(eku);
+
+        assert!(check_basic_constraints(&cert).is_err());
+        assert!(check_key_usage(&cert).is_err());
+        assert!(check_extended_key_usage(&cert).is_err());
     }
 
     #[test]

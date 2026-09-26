@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.6.0 — 2026-09-26
+
+### Changed
+
+- **Breaking:** require riptering 0.7.0. Re-exported provider, capability and
+  error types now come from that release; consumers that use riptering directly
+  must update it alongside ritsp-ltv. The MSRV remains Rust 1.88.
+- Timestamp and revocation verification intentionally reject incomplete or
+  unsupported security profiles. Migration details are in
+  [validation profiles](docs/validation-profiles.md).
+
+### Fixed
+
+- Require an authenticated ESS signing-certificate binding, validate any
+  TSTInfo TSA name against the signer, and enforce the TSA certificate's
+  timestamping purpose and present KeyUsage restrictions in all feature profiles.
+- Reject malformed or duplicate DER extensions and unsupported critical CRL,
+  timestamp, and OCSP extensions instead of ignoring their requirements.
+- Require the complete issuer path and trust store for delegated OCSP responses,
+  including responders with `nocheck`. Add explicit path-aware validation APIs
+  and optional strict nonce echo checking while retaining opportunistic defaults.
+- Enforce fractional timestamp validity at certificate boundaries, apply CA
+  restrictions to trust anchors, and evaluate configured same-key anchor
+  reissues independently. Keep revocation results authoritative regardless of
+  OCSP/CRL preference.
+- Bound TSA/OCSP downloads and CRL cache retention, retain hardened connection
+  and redirect policy, and preserve checks on every authoritative validation.
+
+### Performance and validation
+
+- Compare issuer names before encoding unrelated chain-pool candidates and
+  retain parsed CRL freshness dates in the cache. Publish scoped local
+  measurements in [local performance checks](docs/local-performance.md).
+- Run full supported RustCrypto profiles on Linux, Windows and macOS, Linux
+  document/TLS provider combinations, MSRV checks, and focused FIPS initialization
+  and attestation on Linux x86_64 and ARM. CI uses published, locked dependencies.
+
 ## 0.5.0 — 2026-09-24 — first ritsp-ltv release
 
 Changes relative to tsp-ltv 0.4.0:

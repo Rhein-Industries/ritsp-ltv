@@ -243,6 +243,39 @@ pub async fn check_certificate_revocation(
     ocsp_client: &OcspClient,
     validation_time: Option<DateTime<Utc>>,
 ) -> ValidationStatus {
+    check_certificate_revocation_with_ocsp_context(
+        cert,
+        issuer,
+        config,
+        crl_client,
+        ocsp_client,
+        validation_time,
+        &OcspValidationContext::default(),
+    )
+    .await
+}
+
+/// Additional OCSP validation policy without changing `RevocationConfig`
+/// literals. A delegated responder needs the complete issuer path and store.
+#[derive(Default)]
+pub struct OcspValidationContext<'a> {
+    /// The exact issuer first, followed by intermediates toward the trust store.
+    pub issuer_path: Option<(&'a [Certificate], &'a crate::trust::TrustStore)>,
+    /// Require the response to echo the request nonce. Defaults to false.
+    pub require_nonce: bool,
+}
+
+/// Concurrent revocation checking with delegated OCSP path and nonce policy.
+#[allow(clippy::too_many_arguments)]
+pub async fn check_certificate_revocation_with_ocsp_context(
+    cert: &Certificate,
+    issuer: &Certificate,
+    config: &RevocationConfig,
+    crl_client: &CrlClient,
+    ocsp_client: &OcspClient,
+    validation_time: Option<DateTime<Utc>>,
+    context: &OcspValidationContext<'_>,
+) -> ValidationStatus {
     // Run OCSP and CRL checks concurrently with a per-cert timeout
     let ocsp_fut = run_ocsp_check(
         cert,
@@ -251,38 +284,67 @@ pub async fn check_certificate_revocation(
         crl_client,
         ocsp_client,
         validation_time,
+        context,
     );
     let crl_fut = run_crl_check(cert, issuer, config, crl_client, validation_time);
 
-    // Use tokio::join! for concurrent execution, wrapped in a timeout
-    let result = tokio::time::timeout(config.per_cert_timeout, async {
-        tokio::join!(ocsp_fut, crl_fut)
-    })
-    .await;
-
-    let (ocsp_status, crl_status) = match result {
-        Ok((ocsp, crl)) => (ocsp, crl),
-        Err(_elapsed) => {
-            log::warn!(
-                "per-certificate revocation check timed out after {:?}",
-                config.per_cert_timeout
-            );
-            (
-                ValidationStatus::Unknown {
-                    reason: "OCSP check timed out".into(),
-                },
-                ValidationStatus::Unknown {
-                    reason: "CRL check timed out".into(),
-                },
-            )
-        }
-    };
+    let (ocsp_status, crl_status) =
+        collect_revocation_results(ocsp_fut, crl_fut, config.per_cert_timeout).await;
 
     log::debug!("OCSP result: {ocsp_status}, CRL result: {crl_status}");
 
     // Merge results using priority, then apply the fail-closed policy.
-    let merged = resolve_priority(ocsp_status, crl_status);
+    let merged = merge_preferred(ocsp_status, crl_status, config.prefer_ocsp);
     enforce_revocation_policy(merged, config.require_revocation_check)
+}
+
+fn merge_preferred(
+    ocsp: ValidationStatus,
+    crl: ValidationStatus,
+    prefer_ocsp: bool,
+) -> ValidationStatus {
+    if prefer_ocsp {
+        resolve_priority(ocsp, crl)
+    } else {
+        resolve_priority(crl, ocsp)
+    }
+}
+
+/// Keep completed evidence when the other source exceeds the combined deadline.
+/// Wrapping `join!` in a timeout would discard both results, including a Revoked
+/// result already obtained from one source. Each pending source becomes Unknown.
+async fn collect_revocation_results(
+    ocsp: impl std::future::Future<Output = ValidationStatus>,
+    crl: impl std::future::Future<Output = ValidationStatus>,
+    timeout: Duration,
+) -> (ValidationStatus, ValidationStatus) {
+    tokio::pin!(ocsp, crl);
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut ocsp_status = None;
+    let mut crl_status = None;
+
+    while ocsp_status.is_none() || crl_status.is_none() {
+        tokio::select! {
+            // Consume ready evidence before checking an equally ready deadline.
+            biased;
+            status = &mut ocsp, if ocsp_status.is_none() => ocsp_status = Some(status),
+            status = &mut crl, if crl_status.is_none() => crl_status = Some(status),
+            _ = &mut deadline => {
+                log::warn!("per-certificate revocation check timed out after {timeout:?}");
+                break;
+            }
+        }
+    }
+
+    (
+        ocsp_status.unwrap_or_else(|| ValidationStatus::Unknown {
+            reason: "OCSP check timed out".into(),
+        }),
+        crl_status.unwrap_or_else(|| ValidationStatus::Unknown {
+            reason: "CRL check timed out".into(),
+        }),
+    )
 }
 
 /// Apply the `require_revocation_check` policy to a merged revocation result.
@@ -383,7 +445,13 @@ async fn run_ocsp_check(
     crl_client: &CrlClient,
     ocsp_client: &OcspClient,
     validation_time: Option<DateTime<Utc>>,
+    context: &OcspValidationContext<'_>,
 ) -> ValidationStatus {
+    if context.require_nonce && !config.use_ocsp_nonce {
+        return ValidationStatus::Invalid {
+            reason: "strict OCSP nonce policy requires use_ocsp_nonce".into(),
+        };
+    }
     // Check if cert has OCSP URLs
     let urls = OcspClient::extract_ocsp_urls(cert);
     if urls.is_empty() {
@@ -424,15 +492,32 @@ async fn run_ocsp_check(
         // status (tryLater, internalError, unauthorized, ...) is non-
         // determinative and stays Unknown — so a temporary responder outage
         // does not become a hard failure under best-effort/offline policy.
-        let outcome = match ocsp::check_revocation_detailed(
-            &response_der,
-            cert,
-            issuer,
-            nonce.as_deref(),
-            validation_time,
-            &config.signature_policy,
-            &config.ocsp_freshness,
-        ) {
+        let checked = if let Some((path, store)) = context.issuer_path {
+            ocsp::check_revocation_detailed_with_issuer_path(
+                &response_der,
+                cert,
+                issuer,
+                nonce.as_deref(),
+                validation_time,
+                &config.signature_policy,
+                &config.ocsp_freshness,
+                path,
+                store,
+                context.require_nonce,
+            )
+        } else {
+            ocsp::check_revocation_detailed_with_nonce_policy(
+                &response_der,
+                cert,
+                issuer,
+                nonce.as_deref(),
+                validation_time,
+                &config.signature_policy,
+                &config.ocsp_freshness,
+                context.require_nonce,
+            )
+        };
+        let outcome = match checked {
             Ok(outcome) => outcome,
             Err(e) => return ocsp_check_error_to_status(e),
         };
@@ -470,6 +555,7 @@ async fn run_ocsp_check(
                     crl_client,
                     ocsp_client,
                     validation_time,
+                    context,
                 ))
                 .await;
             if responder_status.is_revoked() || responder_status.is_invalid() {
@@ -519,6 +605,7 @@ async fn check_delegated_responder_revocation(
     crl_client: &CrlClient,
     ocsp_client: &OcspClient,
     validation_time: Option<DateTime<Utc>>,
+    context: &OcspValidationContext<'_>,
 ) -> ValidationStatus {
     let sub_config = RevocationConfig {
         // Decrement the recursion budget; bottom out at 0 (the OCSP path treats
@@ -540,6 +627,7 @@ async fn check_delegated_responder_revocation(
         crl_client,
         ocsp_client,
         validation_time,
+        context,
     );
     let crl_fut = run_crl_check(
         responder,
@@ -549,26 +637,13 @@ async fn check_delegated_responder_revocation(
         validation_time,
     );
 
-    let (ocsp_status, crl_status) = match tokio::time::timeout(config.per_cert_timeout, async {
-        tokio::join!(ocsp_fut, crl_fut)
-    })
-    .await
-    {
-        Ok(pair) => pair,
-        Err(_) => (
-            ValidationStatus::Unknown {
-                reason: "responder OCSP check timed out".into(),
-            },
-            ValidationStatus::Unknown {
-                reason: "responder CRL check timed out".into(),
-            },
-        ),
-    };
+    let (ocsp_status, crl_status) =
+        collect_revocation_results(ocsp_fut, crl_fut, config.per_cert_timeout).await;
 
     // Apply the inherited policy to the merged responder status: under strict,
     // an Unknown (unreachable/absent responder-revocation source) upgrades to
     // Invalid, which the caller treats as blocking.
-    let merged = resolve_priority(ocsp_status, crl_status);
+    let merged = merge_preferred(ocsp_status, crl_status, config.prefer_ocsp);
     enforce_revocation_policy(merged, sub_config.require_revocation_check)
 }
 
@@ -664,7 +739,120 @@ async fn run_crl_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equal_priority_results_use_configured_preference_and_revocation_still_wins() {
+        let now = Utc::now();
+        let ocsp = ValidationStatus::Valid {
+            source: crate::ltv::status::RevocationSource::Ocsp,
+            checked_at: now,
+        };
+        let crl = ValidationStatus::Valid {
+            source: crate::ltv::status::RevocationSource::Crl,
+            checked_at: now,
+        };
+        assert!(matches!(
+            merge_preferred(ocsp.clone(), crl.clone(), true),
+            ValidationStatus::Valid {
+                source: crate::ltv::status::RevocationSource::Ocsp,
+                ..
+            }
+        ));
+        assert!(matches!(
+            merge_preferred(ocsp.clone(), crl, false),
+            ValidationStatus::Valid {
+                source: crate::ltv::status::RevocationSource::Crl,
+                ..
+            }
+        ));
+        let revoked = ValidationStatus::Revoked {
+            source: crate::ltv::status::RevocationSource::Crl,
+            reason: crate::ltv::status::RevocationReason::KeyCompromise,
+            revocation_time: now,
+        };
+        for preference in [true, false] {
+            assert!(merge_preferred(ocsp.clone(), revoked.clone(), preference).is_revoked());
+        }
+    }
     use crate::ltv::status::RevocationSource;
+
+    #[tokio::test]
+    async fn combined_timeout_preserves_a_completed_revoked_result() {
+        let revoked = ValidationStatus::Revoked {
+            source: RevocationSource::Ocsp,
+            reason: crate::ltv::status::RevocationReason::KeyCompromise,
+            revocation_time: DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let (ocsp, crl) = collect_revocation_results(
+            std::future::ready(revoked),
+            std::future::pending(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(ocsp.is_revoked());
+        assert!(crl.is_unknown());
+        assert!(enforce_revocation_policy(resolve_priority(ocsp, crl), false).is_revoked());
+    }
+
+    #[tokio::test]
+    async fn combined_timeout_preserves_completed_crl_evidence() {
+        let valid = ValidationStatus::Valid {
+            source: RevocationSource::Crl,
+            checked_at: DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let (ocsp, crl) = collect_revocation_results(
+            std::future::pending(),
+            std::future::ready(valid),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(ocsp.is_unknown());
+        assert!(crl.is_valid());
+        assert!(enforce_revocation_policy(resolve_priority(ocsp, crl), true).is_valid());
+    }
+
+    #[tokio::test]
+    async fn combined_timeout_marks_only_pending_sources_unknown() {
+        let invalid = ValidationStatus::Invalid {
+            reason: "fixture integrity rejection".into(),
+        };
+        let (ocsp, crl) = collect_revocation_results(
+            std::future::ready(invalid),
+            std::future::pending(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(ocsp.is_invalid());
+        assert!(crl.is_unknown());
+
+        let (ocsp, crl) = collect_revocation_results(
+            std::future::pending(),
+            std::future::pending(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(ocsp.is_unknown());
+        assert!(crl.is_unknown());
+    }
+
+    #[tokio::test]
+    async fn combined_timeout_consumes_ready_evidence_at_the_deadline() {
+        let invalid = ValidationStatus::Invalid {
+            reason: "fixture integrity rejection".into(),
+        };
+        let (ocsp, crl) = collect_revocation_results(
+            std::future::ready(invalid.clone()),
+            std::future::ready(invalid),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(ocsp.is_invalid());
+        assert!(crl.is_invalid());
+    }
 
     // ── RevocationConfig tests ────────────────────────────────────
 

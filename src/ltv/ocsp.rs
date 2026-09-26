@@ -48,6 +48,7 @@
 
 use std::time::Duration;
 
+use chrono::{Datelike, Timelike};
 use der::Encode;
 use x509_cert::Certificate;
 
@@ -68,11 +69,14 @@ const OCSP_BASIC_RESPONSE_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x3
 /// OID for id-pkix-ocsp-nonce (1.3.6.1.5.5.7.48.1.2) — raw OID bytes.
 const OCSP_NONCE_OID_BYTES: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
 
-/// OID for id-kp-OCSPSigning (1.3.6.1.5.5.7.3.9) — raw OID bytes.
-const OCSP_SIGNING_EKU_OID_BYTES: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09];
+/// SHA-1 CertID hash algorithm used in every request (1.3.14.3.2.26).
+const CERT_ID_HASH_ALGORITHM_OID: &[u8] = &[0x2B, 0x0E, 0x03, 0x02, 0x1A];
 
 /// Nonce size in bytes (matches Java stack: 30 bytes).
 const NONCE_SIZE: usize = 30;
+
+/// Generous upper bound for an OCSP response, including embedded certificates.
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 // ── Parsed OCSP response types ─────────────────────────────────────
 
@@ -148,6 +152,7 @@ pub enum ResponderId {
 pub struct OcspClient {
     http_client: AttestedHttpClient,
     timeout: Duration,
+    max_body_size: usize,
 }
 
 impl OcspClient {
@@ -156,6 +161,7 @@ impl OcspClient {
         Ok(Self {
             http_client: crate::net::hardened_http_client()?,
             timeout: Duration::from_secs(30),
+            max_body_size: MAX_BODY_SIZE,
         })
     }
 
@@ -175,6 +181,12 @@ impl OcspClient {
     /// Set the request timeout.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Set the maximum downloaded OCSP response size (10 MiB by default).
+    pub fn max_body_size(mut self, max: usize) -> Self {
+        self.max_body_size = max;
         self
     }
 
@@ -289,11 +301,7 @@ impl OcspClient {
             )));
         }
 
-        let resp_bytes = response
-            .bytes()
-            .await
-            .map_err(|e| LtvError::Ocsp(format!("failed to read OCSP response body: {e}")))?
-            .to_vec();
+        let resp_bytes = self.read_response_body(response, url).await?;
 
         if resp_bytes.is_empty() {
             return Err(LtvError::Ocsp(format!(
@@ -314,6 +322,38 @@ impl OcspClient {
         log::debug!("OCSP response from {url}: {} bytes", resp_bytes.len());
 
         Ok(resp_bytes)
+    }
+
+    /// Bound the body before allocating and while streaming, including when the
+    /// responder omits Content-Length or uses chunked transfer encoding.
+    async fn read_response_body(
+        &self,
+        mut response: reqwest::Response,
+        url: &str,
+    ) -> Result<Vec<u8>, LtvError> {
+        if let Some(len) = response.content_length() {
+            if len > self.max_body_size as u64 {
+                return Err(LtvError::Ocsp(format!(
+                    "OCSP response from {url} exceeds max body size ({len} > {})",
+                    self.max_body_size
+                )));
+            }
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| LtvError::Ocsp(format!("failed to read OCSP response body: {e}")))?
+        {
+            if chunk.len() > self.max_body_size.saturating_sub(body.len()) {
+                return Err(LtvError::Ocsp(format!(
+                    "OCSP response from {url} exceeds max body size (> {})",
+                    self.max_body_size
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 }
 
@@ -845,10 +885,15 @@ fn parse_basic_ocsp_response(der: &[u8]) -> Result<ParsedBasicOcspResponse, LtvE
 
     // responseExtensions [1] EXPLICIT Extensions OPTIONAL
     let mut nonce = None;
-    if !tbs_pos.is_empty() && tbs_pos[0] == 0xA1 {
-        let (_, ext_wrapper, _) = der_utils::parse_tlv_with_rest(tbs_pos)
+    if !tbs_pos.is_empty() {
+        let (tag, ext_wrapper, trailing) = der_utils::parse_tlv_with_rest(tbs_pos)
             .map_err(|e| LtvError::Ocsp(format!("responseExtensions: {e}")))?;
-        nonce = extract_nonce_from_extensions(ext_wrapper);
+        if tag != 0xA1 || !trailing.is_empty() {
+            return Err(LtvError::Ocsp(
+                "unexpected or duplicate responseExtensions fields".into(),
+            ));
+        }
+        nonce = parse_ocsp_extensions(ext_wrapper, true)?;
     }
 
     Ok(ParsedBasicOcspResponse {
@@ -972,8 +1017,16 @@ fn parse_single_response(body: &[u8]) -> Result<SingleResponse, LtvError> {
         pos = rest_after_nu;
     }
 
-    // singleExtensions [1] — skip for now
-    let _ = pos;
+    if !pos.is_empty() {
+        let (tag, extensions, trailing) = der_utils::parse_tlv_with_rest(pos)
+            .map_err(|e| LtvError::Ocsp(format!("singleExtensions: {e}")))?;
+        if tag != 0xA1 || !trailing.is_empty() {
+            return Err(LtvError::Ocsp(
+                "unexpected or duplicate singleExtensions fields".into(),
+            ));
+        }
+        parse_ocsp_extensions(extensions, false)?;
+    }
 
     Ok(SingleResponse {
         hash_algorithm_oid,
@@ -1022,43 +1075,47 @@ fn parse_revoked_info(body: &[u8]) -> Result<CertStatus, LtvError> {
 ///
 /// The nonce extension (OID 1.3.6.1.5.5.7.48.1.2) may contain the nonce
 /// as raw bytes or wrapped in a DER OCTET STRING. We handle both formats.
-fn extract_nonce_from_extensions(ext_area: &[u8]) -> Option<Vec<u8>> {
-    // Extensions is a SEQUENCE OF Extension
-    let (tag, ext_body) = der_utils::parse_tlv(ext_area).ok()?;
-    if tag != 0x30 {
-        return None;
+fn parse_ocsp_extensions(
+    ext_area: &[u8],
+    response_level: bool,
+) -> Result<Option<Vec<u8>>, LtvError> {
+    use der::Decode;
+    let extensions = x509_cert::ext::Extensions::from_der(ext_area)
+        .map_err(|e| LtvError::Ocsp(format!("OCSP extensions: {e}")))?;
+    if extensions.is_empty() {
+        return Err(LtvError::Ocsp("empty OCSP Extensions".into()));
     }
-
-    let mut pos = &ext_body[..];
-    while !pos.is_empty() {
-        let (ext_tag, ext_value, rest) = der_utils::parse_tlv_with_rest(pos).ok()?;
-        if ext_tag == 0x30 {
-            // Extension: { OID, [critical BOOLEAN,] extnValue OCTET STRING }
-            if let Some(oid_body) = der_utils::find_tagged_value(ext_value, 0x06) {
-                if oid_body == OCSP_NONCE_OID_BYTES {
-                    // Found nonce extension — extract value
-                    if let Some(octet_body) = der_utils::find_tagged_value(ext_value, 0x04) {
-                        // The value may be:
-                        // 1. Raw nonce bytes directly in the OCTET STRING
-                        // 2. DER OCTET STRING wrapping the actual nonce
-                        // Try to unwrap one layer of OCTET STRING
-                        if !octet_body.is_empty() && octet_body[0] == 0x04 {
-                            if let Ok((inner_tag, inner_body)) = der_utils::parse_tlv(octet_body) {
-                                if inner_tag == 0x04 {
-                                    return Some(inner_body);
-                                }
-                            }
-                        }
-                        // Raw nonce bytes
-                        return Some(octet_body.to_vec());
-                    }
-                }
-            }
+    let nonce_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.2");
+    let mut seen = std::collections::HashSet::new();
+    let mut nonce = None;
+    for extension in extensions {
+        if !seen.insert(extension.extn_id) {
+            return Err(LtvError::Ocsp(format!(
+                "duplicate OCSP extension {}",
+                extension.extn_id
+            )));
         }
-        pos = rest;
+        if extension.extn_id == nonce_oid {
+            if !response_level {
+                return Err(LtvError::Ocsp(
+                    "nonce is not permitted in singleExtensions".into(),
+                ));
+            }
+            let value = extension.extn_value.as_bytes();
+            // Preserve legacy raw nonce interoperability, but never discard
+            // trailing bytes from an apparent DER OCTET STRING wrapper.
+            nonce = Some(match der_utils::parse_tlv_with_rest(value) {
+                Ok((0x04, body, [])) => body.to_vec(),
+                _ => value.to_vec(),
+            });
+        } else if extension.critical {
+            return Err(LtvError::Ocsp(format!(
+                "unsupported critical OCSP extension {}",
+                extension.extn_id
+            )));
+        }
     }
-
-    None
+    Ok(nonce)
 }
 
 // ── Responder signature verification ───────────────────────────────
@@ -1102,7 +1159,14 @@ fn verify_ocsp_response_signature(
         );
 
         if result.is_ok() {
-            return Ok(candidate.clone());
+            // Embedded certs are unsigned discovery hints. A same-name/key
+            // direct issuer must use the exact caller-authenticated metadata,
+            // including validity and constraints, rather than embedded fields.
+            return Ok(if certs_have_same_identity(candidate, issuer) {
+                issuer.clone()
+            } else {
+                candidate.clone()
+            });
         }
     }
 
@@ -1200,12 +1264,17 @@ fn validate_responder_trust(
 
     // Case 1: responder IS the issuer. The CA signs its own OCSP responses; no
     // separate responder-revocation check applies.
-    if certs_have_same_subject(responder_cert, issuer) {
+    if certs_have_same_identity(responder_cert, issuer) {
         return Ok(ResponderRevocationCheck::NotRequired);
     }
 
     // Case 2: responder is a delegated OCSP signer.
     // Must be issued by the same CA (issuer).
+    if responder_cert.tbs_certificate.issuer != issuer.tbs_certificate.subject {
+        return Err(LtvError::Ocsp(
+            "OCSP responder issuer name does not match the expected CA".into(),
+        ));
+    }
     let issuer_signed = crate::crypto::verify::verify_certificate_signature_with_policy(
         responder_cert,
         issuer,
@@ -1217,12 +1286,16 @@ fn validate_responder_trust(
         ));
     }
 
-    // Must have id-kp-OCSPSigning EKU.
-    if !has_ocsp_signing_eku(responder_cert) {
-        return Err(LtvError::Ocsp(
-            "OCSP responder certificate lacks id-kp-OCSPSigning EKU".into(),
-        ));
-    }
+    validate_delegated_responder_extensions(responder_cert)?;
+
+    // The directly authorizing CA's constraints must also apply to the
+    // delegated signer. Ancestor constraints are applied by the path-aware
+    // check below; issuer-only APIs cannot complete that validation.
+    let mut constraints = crate::ltv::name_constraints::NameConstraintState::default();
+    constraints
+        .add_from_cert(issuer)
+        .and_then(|()| constraints.check_cert(responder_cert))
+        .map_err(|e| LtvError::Ocsp(format!("delegated OCSP responder name constraints: {e}")))?;
 
     // RFC 6960 §4.2.2.2.1: a delegated responder without id-pkix-ocsp-nocheck
     // must itself be revocation-checked. With nocheck, the CA waives that.
@@ -1274,51 +1347,87 @@ fn responder_matches_responder_id(
     }
 }
 
-/// Check if two certificates have the same subject DN (by DER comparison).
-fn certs_have_same_subject(a: &Certificate, b: &Certificate) -> bool {
-    let a_der = a.tbs_certificate.subject.to_der();
-    let b_der = b.tbs_certificate.subject.to_der();
-    match (a_der, b_der) {
-        (Ok(ad), Ok(bd)) => ad == bd,
-        _ => false,
-    }
+/// Bind direct-issuer authorization to its name AND public key. Comparing the
+/// subject alone would let an unrelated embedded certificate claim CA identity.
+/// Same-key CA reissues remain interoperable even when their serials differ.
+fn certs_have_same_identity(a: &Certificate, b: &Certificate) -> bool {
+    a.tbs_certificate.subject == b.tbs_certificate.subject
+        && a.tbs_certificate.subject_public_key_info == b.tbs_certificate.subject_public_key_info
 }
 
-/// Check if a certificate has the id-kp-OCSPSigning extended key usage.
-fn has_ocsp_signing_eku(cert: &Certificate) -> bool {
-    let eku_oid = const_oid::ObjectIdentifier::new_unwrap("2.5.29.37");
+/// Enforce delegated-signing restrictions without adding CA-only restrictions
+/// to the direct-issuer path. Critical extensions must have a processing path
+/// here; the delegated certificate is not passed through TrustStore validation.
+fn validate_delegated_responder_extensions(cert: &Certificate) -> Result<(), LtvError> {
+    use const_oid::AssociatedOid;
+    use der::Decode;
+    use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAltName};
 
+    let mut seen = Vec::new();
     if let Some(extensions) = &cert.tbs_certificate.extensions {
-        for ext in extensions.iter() {
-            if ext.extn_id == eku_oid {
-                // EKU value is SEQUENCE OF OID
-                return eku_contains_oid(ext.extn_value.as_bytes(), OCSP_SIGNING_EKU_OID_BYTES);
+        for ext in extensions {
+            if seen.contains(&ext.extn_id) {
+                return Err(LtvError::Ocsp(format!(
+                    "OCSP responder certificate has duplicate extension {}",
+                    ext.extn_id
+                )));
+            }
+            seen.push(ext.extn_id);
+            let value = ext.extn_value.as_bytes();
+            let processed = match ext.extn_id {
+                oid if oid == KeyUsage::OID => {
+                    // The typed flag decoder masks unused bits; the shared
+                    // strict parser additionally validates their zero padding.
+                    crate::ltv::x509_ext::check_key_usage(cert)?;
+                    let ku = KeyUsage::from_der(value)
+                        .map_err(|e| LtvError::Ocsp(format!("responder keyUsage: {e}")))?;
+                    if !ku.digital_signature() && !ku.non_repudiation() {
+                        return Err(LtvError::Ocsp(
+                            "OCSP responder certificate keyUsage does not permit signing".into(),
+                        ));
+                    }
+                    true
+                }
+                oid if oid == BasicConstraints::OID => {
+                    BasicConstraints::from_der(value)
+                        .map_err(|e| LtvError::Ocsp(format!("responder basicConstraints: {e}")))?;
+                    true
+                }
+                oid if oid == ExtendedKeyUsage::OID => {
+                    ExtendedKeyUsage::from_der(value)
+                        .map_err(|e| LtvError::Ocsp(format!("responder extendedKeyUsage: {e}")))?;
+                    true
+                }
+                oid if oid == SubjectAltName::OID => {
+                    // The OCSP responder's identity is bound to responderID;
+                    // alternative names do not replace that binding.
+                    SubjectAltName::from_der(value)
+                        .map_err(|e| LtvError::Ocsp(format!("responder subjectAltName: {e}")))?;
+                    true
+                }
+                oid if oid == const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.5") => {
+                    if value != [0x05, 0x00] {
+                        return Err(LtvError::Ocsp(
+                            "OCSP responder nocheck extension is not DER NULL".into(),
+                        ));
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if ext.critical && !processed {
+                return Err(LtvError::Ocsp(format!(
+                    "OCSP responder certificate has an unprocessed critical extension {}",
+                    ext.extn_id
+                )));
             }
         }
     }
-    false
-}
-
-/// Check if an EKU extension value contains a specific OID.
-fn eku_contains_oid(eku_der: &[u8], target_oid_bytes: &[u8]) -> bool {
-    let Ok((tag, body)) = der_utils::parse_tlv(eku_der) else {
-        return false;
-    };
-    if tag != 0x30 {
-        return false;
-    }
-
-    let mut pos = &body[..];
-    while !pos.is_empty() {
-        let Ok((oid_tag, oid_body, rest)) = der_utils::parse_tlv_with_rest(pos) else {
-            break;
-        };
-        if oid_tag == 0x06 && oid_body == target_oid_bytes {
-            return true;
-        }
-        pos = rest;
-    }
-    false
+    crate::ltv::x509_ext::validate_extensions_for_role(
+        cert,
+        crate::ltv::x509_ext::CertRole::OcspResponder,
+    )
+    .map_err(|e| LtvError::Ocsp(format!("OCSP responder certificate profile: {e}")))
 }
 
 /// Check if a certificate has the id-pkix-ocsp-nocheck extension.
@@ -1329,7 +1438,7 @@ pub fn has_ocsp_nocheck_extension(cert: &Certificate) -> bool {
 
     if let Some(extensions) = &cert.tbs_certificate.extensions {
         for ext in extensions.iter() {
-            if ext.extn_id == nocheck_oid {
+            if ext.extn_id == nocheck_oid && ext.extn_value.as_bytes() == [0x05, 0x00] {
                 return true;
             }
         }
@@ -1359,8 +1468,8 @@ fn validate_nonce(request_nonce: &[u8], response_nonce: &[u8]) -> Result<(), Ltv
 
     // Or the response nonce may be DER-wrapped and our request nonce is raw
     if !response_nonce.is_empty() && response_nonce[0] == 0x04 {
-        if let Ok((_, inner)) = der_utils::parse_tlv(response_nonce) {
-            if inner == request_nonce {
+        if let Ok((0x04, inner, rest)) = der_utils::parse_tlv_with_rest(response_nonce) {
+            if rest.is_empty() && inner == request_nonce {
                 return Ok(());
             }
         }
@@ -1547,6 +1656,10 @@ pub fn check_revocation_with_policy(
 /// orchestrator as `Invalid` (a received-but-unusable response), never the
 /// fail-open `Unknown`. Later-collected evidence (window at/after the validation
 /// instant) is accepted.
+/// A delegated signer without `nocheck` requires its own revocation check.
+/// This synchronous convenience API returns an error in that case; use the
+/// async revocation orchestrator, or [`check_revocation_detailed`] and complete
+/// the required responder check before relying on its status.
 #[allow(clippy::too_many_arguments)]
 pub fn check_revocation_with_options(
     response_der: &[u8],
@@ -1566,7 +1679,16 @@ pub fn check_revocation_with_options(
         policy,
         freshness,
     )
-    .map(|outcome| outcome.status)
+    .and_then(complete_ocsp_outcome)
+}
+
+fn complete_ocsp_outcome(outcome: OcspCheckOutcome) -> Result<ValidationStatus, LtvError> {
+    if outcome.delegated_responder.is_some() {
+        return Err(LtvError::Ocsp(
+            "delegated responder requires its own revocation check; use check_revocation_detailed or the async orchestrator".into(),
+        ));
+    }
+    Ok(outcome.status)
 }
 
 /// The result of an OCSP revocation check, including any delegated responder
@@ -1585,13 +1707,13 @@ pub struct OcspCheckOutcome {
     pub delegated_responder: Option<Certificate>,
 }
 
-/// Like [`check_revocation_with_options`] but also reports whether the OCSP
-/// response was signed by a delegated responder whose own revocation status must
-/// still be checked (RFC 6960 §4.2.2.2.1 — `id-pkix-ocsp-nocheck` consultation).
+/// Issuer-only detailed OCSP validation. Direct-issuer responses are supported;
+/// delegated responses require [`check_revocation_detailed_with_issuer_path`]
+/// so inherited CA/anchor constraints are not silently omitted.
 ///
-/// Most callers should use [`check_revocation_with_options`]; the async
-/// orchestrator uses this variant so it can perform the responder-revocation
-/// check (which requires network access) itself.
+/// Requested nonce echo is opportunistic here: absence is accepted subject to
+/// freshness, while a present mismatch rejects. Use the nonce-policy or
+/// issuer-path variants for strict required nonce echo.
 #[allow(clippy::too_many_arguments)]
 pub fn check_revocation_detailed(
     response_der: &[u8],
@@ -1602,7 +1724,101 @@ pub fn check_revocation_detailed(
     policy: &crate::crypto::verify::SignaturePolicy,
     freshness: &OcspFreshness,
 ) -> Result<OcspCheckOutcome, LtvError> {
+    check_revocation_detailed_inner(
+        response_der,
+        cert,
+        issuer,
+        nonce,
+        validation_time,
+        policy,
+        freshness,
+        None,
+        false,
+    )
+}
+
+/// Complete OCSP validation using the issuing CA's full certificate path.
+///
+/// `issuer_chain` starts with the exact `issuer` supplied for the CertID and
+/// continues toward `trust_store`. Delegated responder path validation uses
+/// the OCSP-signing role and applies all issuer/anchor name constraints.
+/// `require_nonce` rejects a missing nonce as well as a mismatch; it requires
+/// a request nonce. The default issuer-only APIs keep opportunistic nonce
+/// behavior but reject delegated responders because they lack path context.
+#[allow(clippy::too_many_arguments)]
+pub fn check_revocation_detailed_with_issuer_path(
+    response_der: &[u8],
+    cert: &Certificate,
+    issuer: &Certificate,
+    nonce: Option<&[u8]>,
+    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    policy: &crate::crypto::verify::SignaturePolicy,
+    freshness: &OcspFreshness,
+    issuer_chain: &[Certificate],
+    trust_store: &crate::trust::TrustStore,
+    require_nonce: bool,
+) -> Result<OcspCheckOutcome, LtvError> {
+    if issuer_chain.first() != Some(issuer) {
+        return Err(LtvError::Ocsp(
+            "OCSP issuer path does not start with the expected issuer".into(),
+        ));
+    }
+    check_revocation_detailed_inner(
+        response_der,
+        cert,
+        issuer,
+        nonce,
+        validation_time,
+        policy,
+        freshness,
+        Some((issuer_chain, trust_store)),
+        require_nonce,
+    )
+}
+
+/// Strict nonce binding for direct-issuer responses without a delegated path.
+#[allow(clippy::too_many_arguments)]
+pub fn check_revocation_detailed_with_nonce_policy(
+    response_der: &[u8],
+    cert: &Certificate,
+    issuer: &Certificate,
+    nonce: Option<&[u8]>,
+    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    policy: &crate::crypto::verify::SignaturePolicy,
+    freshness: &OcspFreshness,
+    require_nonce: bool,
+) -> Result<OcspCheckOutcome, LtvError> {
+    check_revocation_detailed_inner(
+        response_der,
+        cert,
+        issuer,
+        nonce,
+        validation_time,
+        policy,
+        freshness,
+        None,
+        require_nonce,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_revocation_detailed_inner(
+    response_der: &[u8],
+    cert: &Certificate,
+    issuer: &Certificate,
+    nonce: Option<&[u8]>,
+    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    policy: &crate::crypto::verify::SignaturePolicy,
+    freshness: &OcspFreshness,
+    issuer_path: Option<(&[Certificate], &crate::trust::TrustStore)>,
+    require_nonce: bool,
+) -> Result<OcspCheckOutcome, LtvError> {
     let now = validation_time.unwrap_or_else(chrono::Utc::now);
+    if require_nonce && nonce.is_none_or(|nonce| nonce.is_empty()) {
+        return Err(LtvError::Ocsp(
+            "strict OCSP nonce policy requires a nonempty request nonce".into(),
+        ));
+    }
 
     // 1. Parse OCSP response
     let parsed = parse_ocsp_response(response_der)?;
@@ -1610,10 +1826,35 @@ pub fn check_revocation_detailed(
     // 2. Verify signature — returns the responder certificate
     let responder_cert = verify_ocsp_response_signature(&parsed, issuer, policy)?;
 
+    if let Some((chain, store)) = issuer_path {
+        validate_ocsp_certificate_path(
+            chain,
+            store,
+            crate::ltv::CertRole::IntermediateCa,
+            policy,
+            now,
+        )?;
+    }
+
     // 3. Validate responder trust (responderID match, cert validity vs. now,
     //    issuer/EKU for delegated responders) and learn whether the responder's
     //    own revocation status must still be checked.
     let responder_check = validate_responder_trust(&responder_cert, issuer, &parsed, policy, now)?;
+    if !certs_have_same_identity(&responder_cert, issuer) {
+        let (issuer_chain, trust_store) = issuer_path.ok_or_else(|| LtvError::Ocsp(
+            "delegated OCSP responder requires complete issuer path validation; use check_revocation_detailed_with_issuer_path".into()
+        ))?;
+        let mut path = Vec::with_capacity(issuer_chain.len() + 1);
+        path.push(responder_cert.clone());
+        path.extend_from_slice(issuer_chain);
+        validate_ocsp_certificate_path(
+            &path,
+            trust_store,
+            crate::ltv::CertRole::OcspResponder,
+            policy,
+            now,
+        )?;
+    }
     let delegated_responder = match responder_check {
         ResponderRevocationCheck::Required => Some(responder_cert.clone()),
         ResponderRevocationCheck::NotRequired => None,
@@ -1626,6 +1867,11 @@ pub fn check_revocation_detailed(
                 validate_nonce(request_nonce, response_nonce)?;
             }
             None => {
+                if require_nonce {
+                    return Err(LtvError::Ocsp(
+                        "OCSP response is missing the required nonce".into(),
+                    ));
+                }
                 // Some responders don't support nonces — log warning but continue
                 log::warn!("OCSP response does not contain a nonce (nonce was requested)");
             }
@@ -1651,11 +1897,12 @@ pub fn check_revocation_detailed(
 
     let cert_serial = der_utils::parse_integer_body(cert.tbs_certificate.serial_number.as_bytes());
 
-    let matching_response = parsed.responses.iter().find(|sr| {
-        sr.issuer_name_hash == expected_name_hash
-            && sr.issuer_key_hash == expected_key_hash
-            && der_utils::integer_bodies_equal(&sr.serial_number, &cert_serial)
-    });
+    let matching_response = find_matching_response(
+        &parsed.responses,
+        &expected_name_hash,
+        &expected_key_hash,
+        &cert_serial,
+    )?;
 
     let sr = match matching_response {
         Some(sr) => sr,
@@ -1715,6 +1962,68 @@ pub fn check_revocation_detailed(
     })
 }
 
+fn validate_ocsp_certificate_path(
+    chain: &[Certificate],
+    store: &crate::trust::TrustStore,
+    role: crate::ltv::CertRole,
+    policy: &crate::crypto::verify::SignaturePolicy,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), LtvError> {
+    let year = u16::try_from(now.year())
+        .map_err(|_| LtvError::Ocsp("OCSP validation year is outside DER DateTime range".into()))?;
+    let at = der::DateTime::new(
+        year,
+        now.month() as u8,
+        now.day() as u8,
+        now.hour() as u8,
+        now.minute() as u8,
+        now.second() as u8,
+    )
+    .map_err(|e| LtvError::Ocsp(format!("OCSP path validation time: {e}")))?;
+    // Intersect both policies before path selection, so a legacy store cannot
+    // weaken a strict OCSP check or select a weak first alternative anchor.
+    let effective = if policy.legacy_allowed() && store.signature_policy().legacy_allowed() {
+        crate::crypto::verify::SignaturePolicy::allow_legacy()
+    } else {
+        crate::crypto::verify::SignaturePolicy::strict()
+    };
+    let scoped = if effective == store.signature_policy() {
+        std::borrow::Cow::Borrowed(store)
+    } else {
+        std::borrow::Cow::Owned(store.clone().with_signature_policy(effective))
+    };
+    scoped
+        .verify_chain_for_purpose_with_fraction(chain, at, role, now.nanosecond() != 0)
+        .map_err(|e| LtvError::Ocsp(format!("OCSP certificate issuer path: {e}")))?;
+    Ok(())
+}
+
+/// A CertID includes its hash algorithm as well as its hashes. Do not interpret
+/// hash bytes as SHA-1 when the response declares another algorithm. Responses
+/// for unrelated certificates may use other algorithms without affecting ours.
+fn find_matching_response<'a>(
+    responses: &'a [SingleResponse],
+    issuer_name_hash: &[u8],
+    issuer_key_hash: &[u8],
+    serial_number: &[u8],
+) -> Result<Option<&'a SingleResponse>, LtvError> {
+    for response in responses {
+        if response.issuer_name_hash == issuer_name_hash
+            && response.issuer_key_hash == issuer_key_hash
+            && der_utils::integer_bodies_equal(&response.serial_number, serial_number)
+        {
+            if response.hash_algorithm_oid != CERT_ID_HASH_ALGORITHM_OID {
+                return Err(LtvError::Ocsp(
+                    "matching OCSP CertID declares an unsupported hash algorithm (expected SHA-1)"
+                        .into(),
+                ));
+            }
+            return Ok(Some(response));
+        }
+    }
+    Ok(None)
+}
+
 /// Compute SHA-1 hash of data.
 fn sha1_hash(data: &[u8]) -> Result<Vec<u8>, LtvError> {
     Ok(riptering::digest::digest(
@@ -1734,6 +2043,96 @@ mod tests {
     fn test_ocsp_client_default() {
         let client = OcspClient::new().unwrap();
         assert_eq!(client.timeout, Duration::from_secs(30));
+        assert_eq!(client.max_body_size, MAX_BODY_SIZE);
+    }
+
+    #[test]
+    fn convenience_status_requires_completed_responder_revocation() {
+        let status = ValidationStatus::Unknown {
+            reason: "synthetic outcome".into(),
+        };
+        assert!(complete_ocsp_outcome(OcspCheckOutcome {
+            status: status.clone(),
+            delegated_responder: None,
+        })
+        .is_ok());
+        assert!(complete_ocsp_outcome(OcspCheckOutcome {
+            status,
+            delegated_responder: Some(signer_cert()),
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("own revocation check"));
+    }
+
+    /// Ordinary HTTP framing fixtures exercise the private body reader directly;
+    /// production URL validation continues to refuse loopback before egress.
+    async fn local_http_response(bytes: &'static [u8]) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(bytes).await.unwrap();
+        });
+        let response = OcspClient::new()
+            .unwrap()
+            .http_client
+            .client()
+            .get(format!("http://{addr}/"))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .unwrap();
+        server.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn response_body_rejects_oversized_content_length() {
+        let response = local_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let error = OcspClient::new()
+            .unwrap()
+            .max_body_size(4)
+            .read_response_body(response, "fixture")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds max body size"));
+    }
+
+    #[tokio::test]
+    async fn response_body_bounds_chunked_downloads() {
+        let response = local_http_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+        )
+        .await;
+        let error = OcspClient::new()
+            .unwrap()
+            .max_body_size(4)
+            .read_response_body(response, "fixture")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds max body size"));
+
+        let response = local_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nABCD",
+        )
+        .await;
+        let body = OcspClient::new()
+            .unwrap()
+            .max_body_size(4)
+            .read_response_body(response, "fixture")
+            .await
+            .unwrap();
+        assert_eq!(body, b"ABCD");
     }
 
     #[tokio::test]
@@ -1754,6 +2153,41 @@ mod tests {
     fn test_sha1_hash() {
         let hash = sha1_hash(b"test").unwrap();
         assert_eq!(hash.len(), 20); // SHA-1 is 20 bytes
+    }
+
+    #[test]
+    fn matching_cert_id_is_bound_to_the_declared_hash_algorithm() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut response = SingleResponse {
+            hash_algorithm_oid: CERT_ID_HASH_ALGORITHM_OID.to_vec(),
+            issuer_name_hash: vec![1; 20],
+            issuer_key_hash: vec![2; 20],
+            serial_number: vec![3],
+            cert_status: CertStatus::Good,
+            this_update: now,
+            next_update: None,
+        };
+        assert!(
+            find_matching_response(&[response.clone()], &[1; 20], &[2; 20], &[3])
+                .unwrap()
+                .is_some()
+        );
+
+        response.hash_algorithm_oid =
+            const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1")
+                .as_bytes()
+                .to_vec();
+        let error =
+            find_matching_response(&[response.clone()], &[1; 20], &[2; 20], &[3]).unwrap_err();
+        assert!(error.to_string().contains("unsupported hash algorithm"));
+        // Unrelated responses are not interpreted or used as evidence for ours.
+        assert!(
+            find_matching_response(&[response], &[1; 20], &[2; 20], &[4])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2466,6 +2900,475 @@ mod tests {
     }
 
     #[test]
+    fn strict_nonce_requires_echo_without_changing_opportunistic_default() {
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+        let key = std::fs::read_to_string(intermediate_ca_key_pem_path()).unwrap();
+        let nonce = b"nonce-binding-test";
+        let at = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let policy = crate::crypto::verify::SignaturePolicy::strict();
+        let freshness = OcspFreshness::default();
+        let absent = build_test_ocsp_response(&issuer, &key, &cert, &CertStatus::Good, None);
+        // Even direct-issuer responses must reach the supplied trust store
+        // when using the complete-path API; an arbitrary caller-provided CA
+        // must not bypass that trust boundary.
+        let empty_store = crate::trust::TrustStore::new();
+        assert!(check_revocation_detailed_with_issuer_path(
+            &absent,
+            &cert,
+            &issuer,
+            None,
+            Some(at),
+            &policy,
+            &freshness,
+            std::slice::from_ref(&issuer),
+            &empty_store,
+            false
+        )
+        .is_err());
+        assert!(check_revocation_detailed(
+            &absent,
+            &cert,
+            &issuer,
+            Some(nonce),
+            Some(at),
+            &policy,
+            &freshness
+        )
+        .unwrap()
+        .status
+        .is_valid());
+        assert!(check_revocation_detailed_with_nonce_policy(
+            &absent,
+            &cert,
+            &issuer,
+            Some(nonce),
+            Some(at),
+            &policy,
+            &freshness,
+            true
+        )
+        .is_err());
+        assert!(check_revocation_detailed_with_nonce_policy(
+            &absent,
+            &cert,
+            &issuer,
+            None,
+            Some(at),
+            &policy,
+            &freshness,
+            true
+        )
+        .is_err());
+        assert!(check_revocation_detailed_with_nonce_policy(
+            &absent,
+            &cert,
+            &issuer,
+            Some(&[]),
+            Some(at),
+            &policy,
+            &freshness,
+            true
+        )
+        .is_err());
+        for response_nonce in [nonce.as_slice(), b"different-nonce".as_slice()] {
+            let response = build_test_ocsp_response(
+                &issuer,
+                &key,
+                &cert,
+                &CertStatus::Good,
+                Some(response_nonce),
+            );
+            assert_eq!(
+                check_revocation_detailed_with_nonce_policy(
+                    &response,
+                    &cert,
+                    &issuer,
+                    Some(nonce),
+                    Some(at),
+                    &policy,
+                    &freshness,
+                    true
+                )
+                .is_ok(),
+                response_nonce == nonce
+            );
+        }
+    }
+
+    fn encode_parsed_ocsp_fixture(parsed: &ParsedBasicOcspResponse) -> Vec<u8> {
+        use der::asn1::BitString;
+        let signature = BitString::from_bytes(&parsed.signature_bytes)
+            .unwrap()
+            .to_der()
+            .unwrap();
+        let certs = der_utils::encode_tlv(
+            0xA0,
+            &der_utils::encode_sequence_raw(&parsed.embedded_certs_der.concat()),
+        );
+        let basic = der_utils::encode_sequence_from_parts(&[
+            &parsed.tbs_response_data,
+            &parsed.signature_algorithm.to_der().unwrap(),
+            &signature,
+            &certs,
+        ]);
+        let response_bytes = der_utils::encode_sequence_from_parts(&[
+            &const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.1")
+                .to_der()
+                .unwrap(),
+            &der_utils::encode_tlv(0x04, &basic),
+        ]);
+        der_utils::encode_sequence_from_parts(&[
+            &[0x0A, 0x01, 0x00],
+            &der_utils::encode_tlv(0xA0, &response_bytes),
+        ])
+    }
+
+    #[test]
+    fn signed_ocsp_rejects_critical_duplicate_and_malformed_extensions_in_both_contexts() {
+        use rsa::pkcs8::DecodePrivateKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+        use sha2::Sha256;
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+        let pem = std::fs::read_to_string(intermediate_ca_key_pem_path()).unwrap();
+        let key =
+            rsa::RsaPrivateKey::from_pkcs8_der(&pem_rfc7468::decode_vec(pem.as_bytes()).unwrap().1)
+                .unwrap();
+        let direct = build_test_ocsp_response(&issuer, &pem, &cert, &CertStatus::Good, None);
+        let mut parsed = parse_ocsp_response(&direct).unwrap();
+        let (_, body) = der_utils::parse_tlv(&parsed.tbs_response_data).unwrap();
+        let mut fields = Vec::new();
+        let mut pos = body.as_slice();
+        while !pos.is_empty() {
+            let (_, _, rest) = der_utils::parse_tlv_with_rest(pos).unwrap();
+            fields.push(pos[..pos.len() - rest.len()].to_vec());
+            pos = rest;
+        }
+        let optional = responder_extension("1.2.3.4.5", false, &[0x05, 0x00])
+            .to_der()
+            .unwrap();
+        let critical = responder_extension("1.2.3.4.5", true, &[0x05, 0x00])
+            .to_der()
+            .unwrap();
+        let nonce = responder_extension(
+            "1.3.6.1.5.5.7.48.1.2",
+            false,
+            &der_utils::encode_tlv(0x04, b"bounded-nonce"),
+        )
+        .to_der()
+        .unwrap();
+        let cases = [
+            (optional.clone(), true, true),
+            (critical, false, false),
+            ([optional.clone(), optional].concat(), false, false),
+            ([nonce.clone(), nonce.clone()].concat(), false, false),
+            (nonce, true, false),
+            (vec![0x30, 0x03, 0x06, 0x01, 0x2A], false, false),
+        ];
+        let at = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for (extensions, response_allowed, single_allowed) in cases {
+            for single in [false, true] {
+                let mut new_fields = fields.clone();
+                let wrapper =
+                    der_utils::encode_tlv(0xA1, &der_utils::encode_sequence_raw(&extensions));
+                if single {
+                    let (_, responses) = der_utils::parse_tlv(&new_fields[2]).unwrap();
+                    let (_, single_body) = der_utils::parse_tlv(&responses).unwrap();
+                    new_fields[2] = der_utils::encode_sequence_raw(
+                        &der_utils::encode_sequence_raw(&[single_body, wrapper].concat()),
+                    );
+                } else {
+                    new_fields.push(wrapper);
+                }
+                parsed.tbs_response_data = der_utils::encode_sequence_raw(&new_fields.concat());
+                let signature: rsa::pkcs1v15::Signature =
+                    rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone())
+                        .sign(&parsed.tbs_response_data);
+                parsed.signature_bytes = signature.to_vec();
+                let response = encode_parsed_ocsp_fixture(&parsed);
+                assert_eq!(
+                    check_revocation(&response, &cert, &issuer, None, Some(at)).is_ok(),
+                    if single {
+                        single_allowed
+                    } else {
+                        response_allowed
+                    }
+                );
+            }
+        }
+        let wrapped = [
+            der_utils::encode_tlv(0x04, b"bounded-nonce"),
+            vec![0x05, 0x00],
+        ]
+        .concat();
+        assert!(validate_nonce(b"bounded-nonce", &wrapped).is_err());
+    }
+
+    #[test]
+    fn direct_issuer_uses_exact_caller_validity_despite_embedded_same_key_hints() {
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+        let key = std::fs::read_to_string(intermediate_ca_key_pem_path()).unwrap();
+        let response = build_test_ocsp_response(&issuer, &key, &cert, &CertStatus::Good, None);
+        let mut parsed = parse_ocsp_response(&response).unwrap();
+        let mut hint = issuer.clone();
+        hint.tbs_certificate.serial_number =
+            x509_cert::serial_number::SerialNumber::new(&[91]).unwrap();
+        hint.tbs_certificate.validity.not_before =
+            x509_cert::time::Time::GeneralTime(der::asn1::GeneralizedTime::from_date_time(
+                der::DateTime::new(2027, 1, 1, 0, 0, 0).unwrap(),
+            ));
+        parsed.embedded_certs_der = vec![hint.to_der().unwrap()];
+        let at = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let policy = crate::crypto::verify::SignaturePolicy::strict();
+        assert_eq!(
+            verify_ocsp_response_signature(&parsed, &issuer, &policy).unwrap(),
+            issuer
+        );
+        let response = encode_parsed_ocsp_fixture(&parsed);
+        assert!(check_revocation(&response, &cert, &issuer, None, Some(at))
+            .unwrap()
+            .is_valid());
+        let mut expired_caller = issuer;
+        expired_caller.tbs_certificate.validity.not_after =
+            x509_cert::time::Time::GeneralTime(der::asn1::GeneralizedTime::from_date_time(
+                der::DateTime::new(2025, 1, 1, 0, 0, 0).unwrap(),
+            ));
+        assert!(
+            check_revocation(&response, &cert, &expired_caller, None, Some(at))
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+    }
+
+    #[test]
+    fn delegated_ocsp_requires_complete_path_and_obeys_ancestor_constraints_even_with_nocheck() {
+        use der::asn1::BitString;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+        use rsa::signature::{Keypair, SignatureEncoding, Signer};
+        use sha2::Sha256;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::SubjectPublicKeyInfoOwned;
+        use x509_cert::time::Validity;
+        let root_pem = std::fs::read_to_string(intermediate_ca_key_pem_path()).unwrap();
+        let root_key = rsa::RsaPrivateKey::from_pkcs8_der(
+            &pem_rfc7468::decode_vec(root_pem.as_bytes()).unwrap().1,
+        )
+        .unwrap();
+        let issuer_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let responder_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let issue = |profile,
+                     subject: &str,
+                     key: &rsa::RsaPrivateKey,
+                     signer_key: &rsa::RsaPrivateKey,
+                     extensions: Vec<x509_cert::ext::Extension>| {
+            let subject_signer = SigningKey::<Sha256>::new(key.clone());
+            let signer = SigningKey::<Sha256>::new(signer_key.clone());
+            let spki = SubjectPublicKeyInfoOwned::from_key(subject_signer.verifying_key()).unwrap();
+            let mut cert = CertificateBuilder::new(
+                profile,
+                SerialNumber::new(&[1]).unwrap(),
+                Validity::from_now(Duration::from_secs(3600)).unwrap(),
+                subject.parse().unwrap(),
+                spki,
+                &signer,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            cert.tbs_certificate
+                .extensions
+                .get_or_insert_default()
+                .extend(extensions);
+            let signature: rsa::pkcs1v15::Signature =
+                signer.sign(&cert.tbs_certificate.to_der().unwrap());
+            cert.signature = BitString::from_bytes(&signature.to_vec()).unwrap();
+            cert
+        };
+        let dns_constraint = der_utils::encode_sequence_raw(&der_utils::encode_tlv(
+            0xA0,
+            &der_utils::encode_sequence_raw(&der_utils::encode_tlv(0x82, b".allowed.example")),
+        ));
+        let root = issue(
+            Profile::Root,
+            "CN=Responder Path Root",
+            &root_key,
+            &root_key,
+            vec![responder_extension("2.5.29.30", true, &dns_constraint)],
+        );
+        let mut issuer = issue(
+            Profile::SubCA {
+                issuer: root.tbs_certificate.subject.clone(),
+                path_len_constraint: None,
+            },
+            "CN=Responder Path Issuer",
+            &issuer_key,
+            &root_key,
+            vec![],
+        );
+        // RFC 5280 permits CA certificates without KeyUsage. The path-aware
+        // OCSP API must agree with generic TrustStore validation on this.
+        issuer
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .retain(|ext| ext.extn_id.to_string() != "2.5.29.15");
+        let issuer_signature: rsa::pkcs1v15::Signature =
+            SigningKey::<Sha256>::new(root_key.clone())
+                .sign(&issuer.tbs_certificate.to_der().unwrap());
+        issuer.signature = BitString::from_bytes(&issuer_signature.to_vec()).unwrap();
+        let mut store = crate::trust::TrustStore::new();
+        store.add_certificate(root).unwrap();
+        let issuer_pem = issuer_key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        // Certificate construction can cross a second on busy hosts; keep
+        // the validation instant after all generated notBefore values.
+        let now = chrono::Utc::now() + chrono::Duration::minutes(1);
+        let at_string = now.format("%Y%m%d%H%M%SZ").to_string();
+        let next = (now + chrono::Duration::minutes(10))
+            .format("%Y%m%d%H%M%SZ")
+            .to_string();
+        let direct = build_test_ocsp_response_with_times(
+            &issuer,
+            &issuer_pem,
+            &signer_cert(),
+            &CertStatus::Good,
+            None,
+            &at_string,
+            &at_string,
+            Some(&next),
+        );
+        let parsed = parse_ocsp_response(&direct).unwrap();
+        for (dns, valid) in [
+            ("responder.allowed.example", true),
+            ("responder.other.example", false),
+        ] {
+            let eku = der_utils::encode_sequence_raw(
+                &const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.9")
+                    .to_der()
+                    .unwrap(),
+            );
+            let san = der_utils::encode_sequence_raw(&der_utils::encode_tlv(0x82, dns.as_bytes()));
+            let responder = issue(
+                Profile::Leaf {
+                    issuer: issuer.tbs_certificate.subject.clone(),
+                    enable_key_agreement: false,
+                    enable_key_encipherment: false,
+                },
+                "CN=Delegated Responder",
+                &responder_key,
+                &issuer_key,
+                vec![
+                    responder_extension("2.5.29.37", false, &eku),
+                    responder_extension("2.5.29.17", false, &san),
+                    responder_extension("1.3.6.1.5.5.7.48.1.5", false, &[0x05, 0x00]),
+                ],
+            );
+            let (_, body) = der_utils::parse_tlv(&parsed.tbs_response_data).unwrap();
+            let (_, _, after_id) = der_utils::parse_tlv_with_rest(&body).unwrap();
+            let responder_id =
+                der_utils::encode_tlv(0xA1, &responder.tbs_certificate.subject.to_der().unwrap());
+            let tbs = der_utils::encode_sequence_raw(&[responder_id, after_id.to_vec()].concat());
+            let signature: rsa::pkcs1v15::Signature =
+                SigningKey::<Sha256>::new(responder_key.clone()).sign(&tbs);
+            let signature = BitString::from_bytes(&signature.to_vec())
+                .unwrap()
+                .to_der()
+                .unwrap();
+            let certs = der_utils::encode_tlv(
+                0xA0,
+                &der_utils::encode_sequence_raw(&responder.to_der().unwrap()),
+            );
+            let basic = der_utils::encode_sequence_from_parts(&[
+                &tbs,
+                &parsed.signature_algorithm.to_der().unwrap(),
+                &signature,
+                &certs,
+            ]);
+            let response_bytes = der_utils::encode_sequence_from_parts(&[
+                &const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.1")
+                    .to_der()
+                    .unwrap(),
+                &der_utils::encode_tlv(0x04, &basic),
+            ]);
+            let response = der_utils::encode_sequence_from_parts(&[
+                &[0x0A, 0x01, 0x00],
+                &der_utils::encode_tlv(0xA0, &response_bytes),
+            ]);
+            let policy = crate::crypto::verify::SignaturePolicy::strict();
+            let freshness = OcspFreshness::default();
+            let denied = check_revocation_detailed(
+                &response,
+                &signer_cert(),
+                &issuer,
+                None,
+                Some(now),
+                &policy,
+                &freshness,
+            )
+            .unwrap_err();
+            assert!(
+                denied.to_string().contains("complete issuer path"),
+                "{denied}"
+            );
+            let result = check_revocation_detailed_with_issuer_path(
+                &response,
+                &signer_cert(),
+                &issuer,
+                None,
+                Some(now),
+                &policy,
+                &freshness,
+                std::slice::from_ref(&issuer),
+                &store,
+                false,
+            );
+            assert_eq!(result.is_ok(), valid, "{dns}: {result:?}");
+            if valid {
+                assert!(result.unwrap().status.is_valid());
+                let mut restricted_issuer = issuer.clone();
+                restricted_issuer
+                    .tbs_certificate
+                    .extensions
+                    .as_mut()
+                    .unwrap()
+                    .push(responder_extension("2.5.29.37", true, &eku));
+                let signature: rsa::pkcs1v15::Signature =
+                    SigningKey::<Sha256>::new(root_key.clone())
+                        .sign(&restricted_issuer.tbs_certificate.to_der().unwrap());
+                restricted_issuer.signature = BitString::from_bytes(&signature.to_vec()).unwrap();
+                let err = check_revocation_detailed_with_issuer_path(
+                    &response,
+                    &signer_cert(),
+                    &restricted_issuer,
+                    None,
+                    Some(now),
+                    &policy,
+                    &freshness,
+                    std::slice::from_ref(&restricted_issuer),
+                    &store,
+                    false,
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string().contains("critical CA extendedKeyUsage"),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_parse_ocsp_response_invalid_data() {
         // Not a valid OCSP response
         let result = parse_ocsp_response(&[0x04, 0x00]); // OCTET STRING
@@ -2477,6 +3380,166 @@ mod tests {
         // Our test certs don't have this extension, so this tests the negative case
         let cert = signer_cert();
         assert!(!has_ocsp_nocheck_extension(&cert));
+    }
+
+    fn responder_extension(oid: &str, critical: bool, value: &[u8]) -> x509_cert::ext::Extension {
+        x509_cert::ext::Extension {
+            extn_id: const_oid::ObjectIdentifier::new(oid).unwrap(),
+            critical,
+            extn_value: der::asn1::OctetString::new(value).unwrap(),
+        }
+    }
+
+    fn delegated_profile_cert() -> Certificate {
+        let mut cert = signer_cert();
+        let oid = der_utils::encode_tlv(0x06, &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09]);
+        let eku = der_utils::encode_sequence_from_parts(&[&oid]);
+        cert.tbs_certificate.extensions = Some(vec![responder_extension("2.5.29.37", false, &eku)]);
+        cert
+    }
+
+    #[test]
+    fn issuer_identity_requires_the_public_key_and_allows_same_key_reissue() {
+        let issuer = intermediate_ca_cert();
+        let mut reissued = issuer.clone();
+        reissued.tbs_certificate.serial_number = signer_cert().tbs_certificate.serial_number;
+        assert!(certs_have_same_identity(&reissued, &issuer));
+
+        reissued.tbs_certificate.subject_public_key_info =
+            signer_cert().tbs_certificate.subject_public_key_info;
+        assert!(!certs_have_same_identity(&reissued, &issuer));
+    }
+
+    #[test]
+    fn responder_trust_rejects_same_name_with_a_different_key() {
+        let issuer = intermediate_ca_cert();
+        let mut responder = signer_cert();
+        responder.tbs_certificate.subject = issuer.tbs_certificate.subject.clone();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // Only authorization is under test; no response or signature is built.
+        let parsed = ParsedBasicOcspResponse {
+            tbs_response_data: Vec::new(),
+            signature_algorithm: issuer.signature_algorithm.clone(),
+            signature_bytes: Vec::new(),
+            responder_id: ResponderId::ByName(issuer.tbs_certificate.subject.to_der().unwrap()),
+            produced_at: now,
+            responses: Vec::new(),
+            nonce: None,
+            embedded_certs_der: Vec::new(),
+        };
+        let error = validate_responder_trust(
+            &responder,
+            &issuer,
+            &parsed,
+            &crate::crypto::verify::SignaturePolicy::default(),
+            now,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not issued by the expected CA"));
+    }
+
+    #[test]
+    fn delegated_responder_key_usage_must_permit_signing() {
+        assert!(validate_delegated_responder_extensions(&delegated_profile_cert()).is_ok());
+        let mut malformed = delegated_profile_cert();
+        malformed
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(responder_extension(
+                "2.5.29.15",
+                true,
+                &[0x03, 0x02, 0x01, 0x81],
+            ));
+        assert!(validate_delegated_responder_extensions(&malformed).is_err());
+        for allowed in [0x80, 0x40] {
+            let mut cert = delegated_profile_cert();
+            cert.tbs_certificate
+                .extensions
+                .as_mut()
+                .unwrap()
+                .push(responder_extension(
+                    "2.5.29.15",
+                    true,
+                    &der_utils::encode_tlv(0x03, &[0x00, allowed]),
+                ));
+            assert!(validate_delegated_responder_extensions(&cert).is_ok());
+        }
+        let mut cert = delegated_profile_cert();
+        cert.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(responder_extension(
+                "2.5.29.15",
+                true,
+                &der_utils::encode_tlv(0x03, &[0x00, 0x20]),
+            ));
+        let error = validate_delegated_responder_extensions(&cert).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("keyUsage does not permit signing"));
+    }
+
+    #[test]
+    fn delegated_responder_rejects_unprocessed_critical_and_duplicate_extensions() {
+        let mut cert = delegated_profile_cert();
+        cert.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(responder_extension("1.2.3.4", true, &[0x05, 0x00]));
+        let error = validate_delegated_responder_extensions(&cert).unwrap_err();
+        assert!(error.to_string().contains("unprocessed critical extension"));
+        cert.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .critical = false;
+        assert!(validate_delegated_responder_extensions(&cert).is_ok());
+
+        let mut cert = delegated_profile_cert();
+        let duplicate = cert.tbs_certificate.extensions.as_ref().unwrap()[0].clone();
+        cert.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(validate_delegated_responder_extensions(&cert)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate extension"));
+    }
+
+    #[test]
+    fn delegated_responder_nocheck_requires_der_null() {
+        let mut cert = delegated_profile_cert();
+        cert.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(responder_extension(
+                "1.3.6.1.5.5.7.48.1.5",
+                false,
+                &[0x05, 0x00],
+            ));
+        assert!(has_ocsp_nocheck_extension(&cert));
+        assert!(validate_delegated_responder_extensions(&cert).is_ok());
+
+        cert.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .extn_value = der::asn1::OctetString::new([0x04, 0x00]).unwrap();
+        assert!(!has_ocsp_nocheck_extension(&cert));
+        assert!(validate_delegated_responder_extensions(&cert).is_err());
     }
 
     #[test]

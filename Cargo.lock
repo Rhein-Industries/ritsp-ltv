@@ -21,6 +21,7 @@ dependencies = [
  "cipher",
  "cpubits",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -35,6 +36,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -45,6 +47,7 @@ checksum = "41ac571010bd60765c56085a4f1d412012a9be2663b1a2f2b19b49318653fd0d"
 dependencies = [
  "aes",
  "const-oid 0.10.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -183,6 +186,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -262,6 +266,7 @@ dependencies = [
  "block-buffer 0.12.1",
  "crypto-common 0.2.2",
  "inout",
+ "zeroize",
 ]
 
 [[package]]
@@ -798,6 +803,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
 dependencies = [
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -1508,6 +1514,7 @@ dependencies = [
  "cpubits",
  "cpufeatures 0.3.0",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -1726,9 +1733,9 @@ dependencies = [
 
 [[package]]
 name = "riptering"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58ec7d38741effea26499d8c9f3d0d782e37b2badde0c16e4d4a67e7dece9ca0"
+checksum = "0ef7db7db5e05ae3b871a9bf9988003b5b20e3ab540791862c5962cef8a5b6de"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1744,6 +1751,7 @@ dependencies = [
  "ed448-goldilocks",
  "generic-array",
  "getrandom 0.4.3",
+ "ghash",
  "hkdf",
  "hmac 0.12.1",
  "md-5",
@@ -1771,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "ritsp-ltv"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64",
  "chrono",
@@ -2125,6 +2133,7 @@ dependencies = [
  "signature 3.0.0",
  "typenum",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]

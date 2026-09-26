@@ -35,6 +35,11 @@ const ID_CONTENT_TYPE_ATTR: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2
 const ID_MESSAGE_DIGEST_ATTR: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
 
+const ID_SIGNING_CERTIFICATE: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.12");
+const ID_SIGNING_CERTIFICATE_V2: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.47");
+
 /// Extended Key Usage extension (2.5.29.37)
 const ID_CE_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
 
@@ -210,33 +215,21 @@ pub struct TimeStampResp {
 /// Parse a DER-encoded RFC 3161 `TimeStampResp`.
 pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspError> {
     // TimeStampResp is a SEQUENCE
-    let (tag, resp_body) = der_utils::parse_tlv(der_bytes)
-        .map_err(|e| TspError::InvalidResponse(format!("failed to parse TimeStampResp: {e}")))?;
-    if tag != 0x30 {
-        return Err(TspError::InvalidResponse(format!(
-            "expected SEQUENCE tag 0x30, got 0x{tag:02x}"
-        )));
+    let (response, trailing) = parse_tst_field(der_bytes, 0x30, "TimeStampResp")?;
+    if !trailing.is_empty() {
+        return Err(TspError::InvalidResponse(
+            "trailing data after TimeStampResp".into(),
+        ));
     }
 
     // First element: PKIStatusInfo SEQUENCE
-    let (status_tag, status_body, rest) = der_utils::parse_tlv_with_rest(&resp_body)
-        .map_err(|e| TspError::InvalidResponse(format!("failed to parse PKIStatusInfo: {e}")))?;
-    if status_tag != 0x30 {
-        return Err(TspError::InvalidResponse(format!(
-            "expected PKIStatusInfo SEQUENCE, got 0x{status_tag:02x}"
-        )));
-    }
+    let (status_info, rest) = parse_tst_field(response.value(), 0x30, "PKIStatusInfo")?;
 
     // PKIStatusInfo: first element is PKIStatus INTEGER
-    let (int_tag, int_body, status_rest) = der_utils::parse_tlv_with_rest(status_body)
-        .map_err(|e| TspError::InvalidResponse(format!("failed to parse PKIStatus: {e}")))?;
-    if int_tag != 0x02 {
-        return Err(TspError::InvalidResponse(format!(
-            "expected INTEGER tag 0x02 for PKIStatus, got 0x{int_tag:02x}"
-        )));
-    }
-    let status_val = der_utils::decode_integer_u64(int_body)
-        .map_err(|e| TspError::InvalidResponse(format!("failed to decode PKIStatus: {e}")))?;
+    let (status_field, status_rest) = parse_tst_field(status_info.value(), 0x02, "PKIStatus")?;
+    let status_val = status_field
+        .decode_as::<u64>()
+        .map_err(|e| TspError::InvalidResponse(format!("PKIStatus: {e}")))?;
     let status = PkiStatus::from_u64(status_val);
 
     // Parse optional statusString and failureInfo from status_rest
@@ -248,12 +241,17 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
     // parse failure here means the response is malformed, so fail hard rather
     // than silently truncating the optional statusString/failureInfo (L-6).
     while !remaining.is_empty() {
-        let (stag, sbody, srest) = der_utils::parse_tlv_with_rest(remaining).map_err(|e| {
-            TspError::InvalidResponse(format!("malformed PKIStatusInfo field: {e}"))
-        })?;
+        let stag = remaining[0];
+        let (field, srest) = parse_tst_field(remaining, stag, "PKIStatusInfo field")?;
+        let sbody = field.value();
         match stag {
             // statusString PKIFreeText ::= SEQUENCE SIZE (1..MAX) OF UTF8String
             0x30 => {
+                if status_string.is_some() || failure_info.is_some() {
+                    return Err(TspError::InvalidResponse(
+                        "PKIStatusInfo: duplicate or out-of-order statusString".into(),
+                    ));
+                }
                 // PKIFreeText is SIZE (1..MAX): a present-but-empty SEQUENCE
                 // violates the constraint, so reject it rather than silently
                 // accepting it and leaving `status_string` as None (L-6).
@@ -269,16 +267,14 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
                 // The first element is surfaced as `status_string`.
                 let mut elems = sbody;
                 while !elems.is_empty() {
-                    let (inner_tag, inner_body, inner_rest) = der_utils::parse_tlv_with_rest(elems)
-                        .map_err(|e| {
-                            TspError::InvalidResponse(format!("malformed statusString: {e}"))
-                        })?;
-                    if inner_tag != 0x0C {
+                    if elems[0] != 0x0C {
                         return Err(TspError::InvalidResponse(format!(
-                            "statusString element is not a UTF8String (tag 0x0c), got 0x{inner_tag:02x}"
+                            "statusString element is not a UTF8String (tag 0x0c), got 0x{:02x}",
+                            elems[0]
                         )));
                     }
-                    let text = std::str::from_utf8(inner_body).map_err(|e| {
+                    let (text_field, inner_rest) = parse_tst_field(elems, 0x0C, "statusString")?;
+                    let text = std::str::from_utf8(text_field.value()).map_err(|e| {
                         TspError::InvalidResponse(format!("statusString is not valid UTF-8: {e}"))
                     })?;
                     if status_string.is_none() {
@@ -289,9 +285,34 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
             }
             // BIT STRING (failureInfo)
             0x03 => {
+                if failure_info.is_some() {
+                    return Err(TspError::InvalidResponse(
+                        "PKIStatusInfo: duplicate failureInfo".into(),
+                    ));
+                }
+                let bits = field
+                    .decode_as::<der::asn1::BitStringRef<'_>>()
+                    .map_err(|e| {
+                        TspError::InvalidResponse(format!("PKIStatusInfo failureInfo: {e}"))
+                    })?;
+                let unused = bits.unused_bits();
+                if bits
+                    .raw_bytes()
+                    .last()
+                    .is_some_and(|byte| byte & ((1u8 << unused) - 1) != 0)
+                {
+                    return Err(TspError::InvalidResponse(
+                        "PKIStatusInfo failureInfo: nonzero unused bits".into(),
+                    ));
+                }
+                // Keep the public field's existing raw BIT STRING body format.
                 failure_info = Some(sbody.to_vec());
             }
-            _ => {}
+            _ => {
+                return Err(TspError::InvalidResponse(format!(
+                    "PKIStatusInfo: unexpected field 0x{stag:02x}"
+                )))
+            }
         }
         remaining = srest;
     }
@@ -302,13 +323,7 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
         // SEQUENCE that consumes ALL remaining bytes of the TimeStampResp — any
         // trailing bytes after it are malformed and rejected rather than being
         // folded into token_der or ignored (L-6).
-        let (token_tag, _, after) = der_utils::parse_tlv_with_rest(rest)
-            .map_err(|e| TspError::InvalidResponse(format!("failed to parse token TLV: {e}")))?;
-        if token_tag != 0x30 {
-            return Err(TspError::InvalidResponse(format!(
-                "expected TimeStampToken SEQUENCE (0x30), got 0x{token_tag:02x}"
-            )));
-        }
+        let (_, after) = parse_tst_field(rest, 0x30, "TimeStampToken SEQUENCE")?;
         if !after.is_empty() {
             return Err(TspError::InvalidResponse(
                 "trailing data after TimeStampToken in TimeStampResp".into(),
@@ -336,6 +351,8 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
 /// - the CMS `SignerInfo` signature is verified over the signed attributes;
 /// - the `content-type` and `message-digest` signed attributes are checked to
 ///   bind the signature to the `TSTInfo` content;
+/// - a signed ESS certificate identifier binds the exact signer certificate,
+///   and an optional `TSTInfo.tsa` matches a subject/SAN name;
 /// - the signing certificate is required to carry a critical
 ///   `id-kp-timeStamping` extended key usage.
 ///
@@ -356,6 +373,24 @@ pub fn validate_timestamp_response(
     digest_algorithm: DigestAlgorithm,
     extra_certs: &[Certificate],
 ) -> Result<Vec<u8>, TspError> {
+    validate_timestamp_response_for_policy(
+        resp,
+        expected_hash,
+        expected_nonce,
+        digest_algorithm,
+        extra_certs,
+        None,
+    )
+}
+
+pub(crate) fn validate_timestamp_response_for_policy(
+    resp: &TimeStampResp,
+    expected_hash: &[u8],
+    expected_nonce: Option<u64>,
+    digest_algorithm: DigestAlgorithm,
+    extra_certs: &[Certificate],
+    expected_policy: Option<&ObjectIdentifier>,
+) -> Result<Vec<u8>, TspError> {
     // Check status
     if !resp.status.is_success() {
         let msg = match &resp.status_string {
@@ -374,8 +409,23 @@ pub fn validate_timestamp_response(
 
     // Validate message imprint hash / algorithm / nonce against the request.
     check_tst_info_matches(&tst_info, expected_hash, expected_nonce, digest_algorithm)?;
+    check_tst_policy(tst_info.policy_oid.as_deref(), expected_policy)?;
 
     Ok(token_der.clone())
+}
+
+pub(crate) fn check_tst_policy(
+    actual: Option<&str>,
+    expected: Option<&ObjectIdentifier>,
+) -> Result<(), TspError> {
+    if let Some(expected) = expected {
+        if actual != Some(expected.to_string().as_str()) {
+            return Err(TspError::VerificationFailed(
+                "timestamp policy does not match requested policy".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Fully verify an RFC 3161 timestamp token, including chaining the TSA
@@ -390,8 +440,9 @@ pub fn validate_timestamp_response(
 /// 3. Check the `content-type` and `message-digest` signed attributes bind the
 ///    signature to the encapsulated `TSTInfo`.
 /// 4. Require a critical `id-kp-timeStamping` EKU on the signing certificate.
-/// 5. Confirm the message imprint hash/algorithm (and nonce, if supplied) match.
-/// 6. If `trust_store` is provided: build the certificate chain from the
+/// 5. Check mandatory signed ESS certificate bindings and optional TSA name.
+/// 6. Confirm the message imprint hash/algorithm (and nonce, if supplied) match.
+/// 7. If `trust_store` is provided: build the certificate chain from the
 ///    available certificates and verify it terminates at a trust anchor.
 ///
 /// The CMS `certificates` field is optional (RFC 5652) and some TSAs omit it
@@ -447,14 +498,12 @@ pub fn verify_timestamp_token(
         // always-compiled CMS path already enforces the same TSA profile
         // (critical timeStamping EKU via `require_timestamping_eku`, not-a-CA via
         // `require_not_ca`), so both build configurations reject the same certs.
-        #[cfg(feature = "ltv")]
-        let chain_result = store.verify_chain_for_purpose(
+        let positive_fraction = validation_time.is_none() && gen_time_parts(&tst_info)?.1;
+        let chain_result = store.verify_timestamp_chain(
             &chain,
-            effective_time,
-            crate::ltv::CertRole::TimestampSigner,
+            effective_time.expect("timestamp validation time is always supplied"),
+            positive_fraction,
         );
-        #[cfg(not(feature = "ltv"))]
-        let chain_result = store.verify_chain(&chain, effective_time);
         // The error covers both chain-building/anchor failures and, under `ltv`,
         // leaf purpose/profile violations (missing timeStamping EKU, non-critical
         // EKU, CA:TRUE), so keep the message general and defer to the inner error
@@ -546,10 +595,7 @@ fn verify_token_cms(
         }
     }
     for cert in extra_certs {
-        if !embedded
-            .iter()
-            .any(|c| c.tbs_certificate == cert.tbs_certificate)
-        {
+        if !embedded.iter().any(|c| c == cert) {
             embedded.push(cert.clone());
         }
     }
@@ -566,10 +612,40 @@ fn verify_token_cms(
         ));
     }
 
-    // Locate the signing certificate identified by SignerInfo.sid.
-    let signer = find_signer_cert(&signer_info.sid, &embedded).ok_or_else(|| {
+    // RFC 3161 §2.4.2 / RFC 5816: ESS binds the actual certificate, not only
+    // its public key or the unsigned SignerIdentifier. Both versions, when
+    // present, must bind the same certificate (RFC 5035 §2).
+    let bindings = signing_certificate_bindings(signed_attrs)?;
+    if let Some(unsigned) = &signer_info.unsigned_attrs {
+        if unsigned
+            .iter()
+            .any(|a| a.oid == ID_SIGNING_CERTIFICATE || a.oid == ID_SIGNING_CERTIFICATE_V2)
+        {
+            return Err(TspError::VerificationFailed(
+                "ESS signing-certificate attribute must be signed".into(),
+            ));
+        }
+    }
+    let mut signer = None;
+    for cert in &embedded {
+        if !signer_identifier_matches(&signer_info.sid, cert) {
+            continue;
+        }
+        let mut matches = true;
+        for binding in &bindings {
+            if !binding.matches(cert)? {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            signer = Some(cert.clone());
+            break;
+        }
+    }
+    let signer = signer.ok_or_else(|| {
         TspError::VerificationFailed(
-            "signing certificate identified by SignerInfo not found in token or extra_certs".into(),
+            "no signing certificate matches SignerInfo and ESS certificate bindings".into(),
         )
     })?;
 
@@ -646,9 +722,11 @@ fn verify_token_cms(
     // a `tsp`-only build (which calls plain `verify_chain`) would otherwise
     // accept a CA certificate carrying a critical timeStamping EKU.
     require_not_ca(&signer)?;
+    require_timestamp_signing_key_usage(&signer)?;
 
     // The TSTInfo is now authenticated; parse its fields.
     let tst_info = parse_tst_info_body(&tst_info_der)?;
+    check_tsa_identity(&tst_info_der, &signer)?;
 
     // RFC 3161: genTime must fall within the signing certificate's validity.
     // This holds independently of any trust store, so enforce it on every
@@ -656,6 +734,205 @@ fn verify_token_cms(
     check_gen_time_within_validity(&signer, &tst_info)?;
 
     Ok((VerifiedToken { signer, embedded }, tst_info))
+}
+
+/// A single ESS certificate identity. Restrictive multi-certificate/policy
+/// profiles are rejected rather than silently ignoring path restrictions.
+struct EssBinding {
+    digest: riptering::HashAlgorithm,
+    hash: Vec<u8>,
+    issuer_serial: Option<(
+        x509_cert::name::Name,
+        x509_cert::serial_number::SerialNumber,
+    )>,
+}
+
+impl EssBinding {
+    fn matches(&self, cert: &Certificate) -> Result<bool, TspError> {
+        use subtle::ConstantTimeEq;
+        if self.issuer_serial.as_ref().is_some_and(|(issuer, serial)| {
+            issuer != &cert.tbs_certificate.issuer || serial != &cert.tbs_certificate.serial_number
+        }) {
+            return Ok(false);
+        }
+        let der = cert
+            .to_der()
+            .map_err(|e| TspError::VerificationFailed(format!("ESS certificate encoding: {e}")))?;
+        let hash = riptering::digest::digest(self.digest, &der)?;
+        Ok(bool::from(hash.ct_eq(&self.hash)))
+    }
+}
+
+fn signing_certificate_bindings(
+    attrs: &x509_cert::attr::Attributes,
+) -> Result<Vec<EssBinding>, TspError> {
+    let mut bindings = Vec::new();
+    for (oid, v2) in [
+        (ID_SIGNING_CERTIFICATE, false),
+        (ID_SIGNING_CERTIFICATE_V2, true),
+    ] {
+        if let Some(value) = find_attribute(attrs, &oid)? {
+            bindings.push(parse_ess_binding(value, v2)?);
+        }
+    }
+    if bindings.is_empty() {
+        return Err(TspError::VerificationFailed(
+            "timestamp signedAttrs lacks ESS SigningCertificate/SigningCertificateV2".into(),
+        ));
+    }
+    Ok(bindings)
+}
+
+fn parse_ess_binding(value: &der::Any, v2: bool) -> Result<EssBinding, TspError> {
+    use x509_cert::ext::pkix::name::GeneralName;
+    let encoded = value
+        .to_der()
+        .map_err(|e| TspError::InvalidResponse(format!("ESS: {e}")))?;
+    let (attribute, trailing) = parse_tst_field(&encoded, 0x30, "ESS signing certificate")?;
+    if !trailing.is_empty() {
+        return Err(TspError::InvalidResponse("ESS trailing data".into()));
+    }
+    let (certs, policies) = parse_tst_field(attribute.value(), 0x30, "ESS certs")?;
+    // Additional identifiers restrict path certificates (RFC 5035 §3/§5).
+    // This verifier does not implement certificate policy-tree processing.
+    if !policies.is_empty() {
+        return Err(TspError::VerificationFailed(
+            "ESS certificate policy restrictions are unsupported".into(),
+        ));
+    }
+    let (id, more) = parse_tst_field(certs.value(), 0x30, "ESS certificate ID")?;
+    if !more.is_empty() {
+        return Err(TspError::VerificationFailed(
+            "ESS multiple certificate restrictions are unsupported".into(),
+        ));
+    }
+    let mut pos = id.value();
+    let mut digest = if v2 {
+        riptering::HashAlgorithm::Sha256
+    } else {
+        riptering::HashAlgorithm::Sha1
+    };
+    if v2 && pos.first() == Some(&0x30) {
+        let (alg, rest) = parse_tst_field(pos, 0x30, "ESS hashAlgorithm")?;
+        let alg = alg
+            .decode_as::<spki::AlgorithmIdentifierRef<'_>>()
+            .map_err(|e| TspError::InvalidResponse(format!("ESS hashAlgorithm: {e}")))?;
+        if alg.parameters.is_some_and(|p| !p.is_null()) {
+            return Err(TspError::InvalidResponse(
+                "ESS hash parameters must be absent or NULL".into(),
+            ));
+        }
+        digest = if alg.oid == ObjectIdentifier::new_unwrap("1.3.14.3.2.26") {
+            riptering::HashAlgorithm::Sha1
+        } else {
+            oid_to_digest_algorithm(&alg.oid)?.into()
+        };
+        pos = rest;
+    }
+    let (hash, rest) = parse_tst_field(pos, 0x04, "ESS certHash")?;
+    let expected_len = match digest {
+        riptering::HashAlgorithm::Sha1 => 20,
+        riptering::HashAlgorithm::Sha256 | riptering::HashAlgorithm::Sha3_256 => 32,
+        riptering::HashAlgorithm::Sha384 | riptering::HashAlgorithm::Sha3_384 => 48,
+        riptering::HashAlgorithm::Sha512 | riptering::HashAlgorithm::Sha3_512 => 64,
+        _ => return Err(TspError::InvalidResponse("unsupported ESS digest".into())),
+    };
+    if hash.value().len() != expected_len {
+        return Err(TspError::InvalidResponse(
+            "ESS certHash has incorrect length".into(),
+        ));
+    }
+    let issuer_serial = if rest.is_empty() {
+        None
+    } else {
+        let (issuer_serial, trailing) = parse_tst_field(rest, 0x30, "ESS issuerSerial")?;
+        if !trailing.is_empty() {
+            return Err(TspError::InvalidResponse(
+                "ESS certificate ID trailing fields".into(),
+            ));
+        }
+        let (names, rest) = parse_tst_field(issuer_serial.value(), 0x30, "ESS issuer names")?;
+        let names = names
+            .decode_as::<x509_cert::ext::pkix::name::GeneralNames>()
+            .map_err(|e| TspError::InvalidResponse(format!("ESS issuer names: {e}")))?;
+        let issuer = match names.as_slice() {
+            [GeneralName::DirectoryName(name)] => name.clone(),
+            _ => {
+                return Err(TspError::InvalidResponse(
+                    "ESS issuer must be exactly one directoryName".into(),
+                ))
+            }
+        };
+        let (serial, trailing) = parse_tst_field(rest, 0x02, "ESS serialNumber")?;
+        if !trailing.is_empty() {
+            return Err(TspError::InvalidResponse(
+                "ESS issuerSerial trailing fields".into(),
+            ));
+        }
+        let serial = serial
+            .decode_as::<x509_cert::serial_number::SerialNumber>()
+            .map_err(|e| TspError::InvalidResponse(format!("ESS serialNumber: {e}")))?;
+        Some((issuer, serial))
+    };
+    Ok(EssBinding {
+        digest,
+        hash: hash.value().to_vec(),
+        issuer_serial,
+    })
+}
+
+/// RFC 3161 §2.4.2: an optional tsa must be one of the signer's names. Exact
+/// typed names are used, with case-insensitive DNS names; wildcard matching
+/// and general directory-string normalization are deliberately not inferred.
+fn check_tsa_identity(tst_der: &[u8], signer: &Certificate) -> Result<(), TspError> {
+    use x509_cert::ext::pkix::{name::GeneralName, SubjectAltName};
+    let (sequence, _) = parse_tst_field(tst_der, 0x30, "TSTInfo")?;
+    let mut pos = sequence.value();
+    while !pos.is_empty() {
+        let is_tsa = pos[0] == 0xA0;
+        let (field, rest) = parse_tst_field(pos, pos[0], "TSTInfo identity")?;
+        pos = rest;
+        if !is_tsa {
+            continue;
+        }
+        let name = GeneralName::from_der(field.value()).map_err(|e| {
+            TspError::VerificationFailed(format!(
+                "TSTInfo tsa name is malformed or unsupported: {e}"
+            ))
+        })?;
+        if matches!(&name, GeneralName::DirectoryName(n) if n == &signer.tbs_certificate.subject) {
+            return Ok(());
+        }
+        let san_oid = ObjectIdentifier::new_unwrap("2.5.29.17");
+        let mut sans = signer
+            .tbs_certificate
+            .extensions
+            .iter()
+            .flatten()
+            .filter(|e| e.extn_id == san_oid);
+        let san = sans.next();
+        if sans.next().is_some() {
+            return Err(TspError::VerificationFailed(
+                "TSA certificate has duplicate subjectAltName".into(),
+            ));
+        }
+        if let Some(san) = san {
+            let san = SubjectAltName::from_der(san.extn_value.as_bytes())
+                .map_err(|e| TspError::VerificationFailed(format!("TSA subjectAltName: {e}")))?;
+            if san.0.iter().any(|candidate| match (&name, candidate) {
+                (GeneralName::DnsName(a), GeneralName::DnsName(b)) => {
+                    a.as_str().eq_ignore_ascii_case(b.as_str())
+                }
+                _ => &name == candidate,
+            }) {
+                return Ok(());
+            }
+        }
+        return Err(TspError::VerificationFailed(
+            "TSTInfo tsa does not match signer subject or subjectAltName".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate that a parsed [`TstInfo`] matches the request's expected hash,
@@ -706,26 +983,17 @@ fn check_tst_info_matches(
     Ok(())
 }
 
-/// Find the certificate identified by a CMS `SignerIdentifier` among `certs`.
-fn find_signer_cert(
-    sid: &cms::signed_data::SignerIdentifier,
-    certs: &[Certificate],
-) -> Option<Certificate> {
+/// Check whether a certificate matches the CMS `SignerIdentifier`.
+fn signer_identifier_matches(sid: &cms::signed_data::SignerIdentifier, cert: &Certificate) -> bool {
     use cms::signed_data::SignerIdentifier;
     match sid {
-        SignerIdentifier::IssuerAndSerialNumber(iasn) => certs
-            .iter()
-            .find(|c| {
-                c.tbs_certificate.issuer == iasn.issuer
-                    && c.tbs_certificate.serial_number == iasn.serial_number
-            })
-            .cloned(),
+        SignerIdentifier::IssuerAndSerialNumber(iasn) => {
+            cert.tbs_certificate.issuer == iasn.issuer
+                && cert.tbs_certificate.serial_number == iasn.serial_number
+        }
         SignerIdentifier::SubjectKeyIdentifier(skid) => {
             let want = skid.0.as_bytes();
-            certs
-                .iter()
-                .find(|c| cert_ski(c).as_deref() == Some(want))
-                .cloned()
+            cert_ski(cert).as_deref() == Some(want)
         }
     }
 }
@@ -907,14 +1175,15 @@ fn require_timestamping_eku(cert: &Certificate) -> Result<(), TspError> {
     let exts = cert.tbs_certificate.extensions.as_ref().ok_or_else(|| {
         TspError::VerificationFailed("TSA certificate has no extensions (no EKU)".into())
     })?;
-    let eku_ext = exts
-        .iter()
-        .find(|e| e.extn_id == ID_CE_EXT_KEY_USAGE)
-        .ok_or_else(|| {
-            TspError::VerificationFailed(
-                "TSA certificate lacks an extendedKeyUsage extension".into(),
-            )
-        })?;
+    let mut eku_extensions = exts.iter().filter(|e| e.extn_id == ID_CE_EXT_KEY_USAGE);
+    let eku_ext = eku_extensions.next().ok_or_else(|| {
+        TspError::VerificationFailed("TSA certificate lacks an extendedKeyUsage extension".into())
+    })?;
+    if eku_extensions.next().is_some() {
+        return Err(TspError::VerificationFailed(
+            "TSA certificate has duplicate extendedKeyUsage extensions".into(),
+        ));
+    }
 
     if !eku_ext.critical {
         return Err(TspError::VerificationFailed(
@@ -922,31 +1191,73 @@ fn require_timestamping_eku(cert: &Certificate) -> Result<(), TspError> {
         ));
     }
 
-    if !eku_contains(eku_ext.extn_value.as_bytes(), &ID_KP_TIME_STAMPING) {
+    let eku = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(eku_ext.extn_value.as_bytes())
+        .map_err(|e| TspError::VerificationFailed(format!("TSA extendedKeyUsage: {e}")))?;
+    if eku.0.as_slice() != [ID_KP_TIME_STAMPING] {
         return Err(TspError::VerificationFailed(
-            "TSA certificate extendedKeyUsage does not include id-kp-timeStamping".into(),
+            "TSA certificate extendedKeyUsage must contain only id-kp-timeStamping (RFC 3161 §2.3)"
+                .into(),
         ));
     }
 
     Ok(())
 }
 
-/// Require that `cert` is not a CA: its `basicConstraints` extension, if
-/// present, must not assert `cA:TRUE`.
-///
-/// An **absent** `basicConstraints` extension is accepted — RFC 5280 §4.2.1.9
-/// defaults `cA` to FALSE, so an end-entity TSA certificate legitimately omits
-/// it; rejecting such a certificate would falsely reject valid timestamps. A
-/// malformed extension is a hard failure (fail closed). Uses the always-compiled
-/// `der_utils` parser so the check is feature-independent (both `tsp`-only and
-/// `ltv` builds enforce it).
+/// A present keyUsage must permit the timeStamping EKU's signing purpose in
+/// every build. Absence imposes no additional key-usage restriction.
+pub(crate) fn require_timestamp_signing_key_usage(cert: &Certificate) -> Result<(), TspError> {
+    let oid = ObjectIdentifier::new_unwrap("2.5.29.15");
+    let mut extensions = cert
+        .tbs_certificate
+        .extensions
+        .iter()
+        .flatten()
+        .filter(|ext| ext.extn_id == oid);
+    let Some(extension) = extensions.next() else {
+        return Ok(());
+    };
+    if extensions.next().is_some() {
+        return Err(TspError::VerificationFailed(
+            "TSA certificate has duplicate keyUsage".into(),
+        ));
+    }
+    let bits = der::asn1::BitStringRef::from_der(extension.extn_value.as_bytes())
+        .map_err(|e| TspError::VerificationFailed(format!("TSA keyUsage: {e}")))?;
+    let raw = bits.raw_bytes();
+    if raw.is_empty()
+        || raw
+            .last()
+            .is_some_and(|last| last & ((1u8 << bits.unused_bits()) - 1) != 0)
+    {
+        return Err(TspError::VerificationFailed(
+            "TSA keyUsage has invalid padding/content".into(),
+        ));
+    }
+    // RFC 5280 §4.2.1.12: KU and EKU apply together, even when KU is
+    // non-critical. timeStamping permits digitalSignature/nonRepudiation.
+    if raw[0] & 0xC0 == 0 {
+        return Err(TspError::VerificationFailed(
+            "TSA keyUsage does not permit signing".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A TSA certificate must not assert cA:TRUE. An absent basicConstraints
+/// defaults to false; malformed or duplicate extensions fail closed.
 fn require_not_ca(cert: &Certificate) -> Result<(), TspError> {
     let Some(exts) = cert.tbs_certificate.extensions.as_ref() else {
         return Ok(()); // no extensions => no basicConstraints => not a CA
     };
-    let Some(bc_ext) = exts.iter().find(|e| e.extn_id == ID_CE_BASIC_CONSTRAINTS) else {
+    let mut bc_extensions = exts.iter().filter(|e| e.extn_id == ID_CE_BASIC_CONSTRAINTS);
+    let Some(bc_ext) = bc_extensions.next() else {
         return Ok(()); // absent basicConstraints => cA defaults to FALSE
     };
+    if bc_extensions.next().is_some() {
+        return Err(TspError::VerificationFailed(
+            "TSA certificate has duplicate basicConstraints extensions".into(),
+        ));
+    }
     let (is_ca, _) = der_utils::parse_basic_constraints(bc_ext.extn_value.as_bytes())
         .map_err(|e| TspError::VerificationFailed(format!("TSA basicConstraints: {e}")))?;
     if is_ca {
@@ -955,31 +1266,6 @@ fn require_not_ca(cert: &Certificate) -> Result<(), TspError> {
         ));
     }
     Ok(())
-}
-
-/// Return true if an EKU extension value (SEQUENCE OF OID) contains `target`.
-fn eku_contains(eku_der: &[u8], target: &ObjectIdentifier) -> bool {
-    let Ok((tag, body)) = der_utils::parse_tlv(eku_der) else {
-        return false;
-    };
-    if tag != 0x30 {
-        return false;
-    }
-    let mut pos = &body[..];
-    while !pos.is_empty() {
-        let Ok((oid_tag, oid_body, rest)) = der_utils::parse_tlv_with_rest(pos) else {
-            break;
-        };
-        if oid_tag == 0x06 {
-            if let Ok(oid) = ObjectIdentifier::from_der(&der_utils::encode_tlv(0x06, oid_body)) {
-                if oid == *target {
-                    return true;
-                }
-            }
-        }
-        pos = rest;
-    }
-    false
 }
 
 /// Order embedded certificates into a chain `[signer, issuer, ...]`.
@@ -1037,11 +1323,36 @@ fn order_chain(
 
 /// Decode the timestamp's `genTime` (GeneralizedTime) to a `der::DateTime`.
 fn gen_time_datetime(tst_info: &TstInfo) -> Result<der::DateTime, TspError> {
-    // gen_time_der holds the GeneralizedTime *contents*; re-wrap to decode.
-    let gt_tlv = der_utils::encode_tlv(0x18, &tst_info.gen_time_der);
+    Ok(gen_time_parts(tst_info)?.0)
+}
+
+/// DER GeneralizedTime uses UTC seconds with an optional fractional second,
+/// no comma and no trailing fractional zero (RFC 3161 §2.4.2 / X.690 §11.7).
+/// Certificate times have whole-second resolution. Preserve the exact bytes
+/// for callers, and carry whether the fraction is positive for end boundaries.
+fn gen_time_parts(tst_info: &TstInfo) -> Result<(der::DateTime, bool), TspError> {
+    let bytes = &tst_info.gen_time_der;
+    let fractional = if bytes.len() == 15 && bytes[14] == b'Z' {
+        false
+    } else if bytes.len() >= 17
+        && bytes[14] == b'.'
+        && bytes.last() == Some(&b'Z')
+        && bytes[15..bytes.len() - 1].iter().all(u8::is_ascii_digit)
+        && bytes[bytes.len() - 2] != b'0'
+    {
+        true
+    } else {
+        return Err(TspError::VerificationFailed(
+            "invalid DER genTime fractional/UTC encoding".into(),
+        ));
+    };
+    let mut seconds = bytes[..14].to_vec();
+    seconds.push(b'Z');
+    let gt_tlv = der_utils::encode_tlv(0x18, &seconds);
     Ok(der::asn1::GeneralizedTime::from_der(&gt_tlv)
         .map_err(|e| TspError::VerificationFailed(format!("invalid genTime: {e}")))?
         .to_date_time())
+    .map(|time| (time, fractional))
 }
 
 /// Confirm the timestamp's `genTime` falls within the signer certificate's
@@ -1050,13 +1361,13 @@ fn check_gen_time_within_validity(
     signer: &Certificate,
     tst_info: &TstInfo,
 ) -> Result<(), TspError> {
-    let gen_time = gen_time_datetime(tst_info)?;
+    let (gen_time, fractional) = gen_time_parts(tst_info)?;
 
     let validity = &signer.tbs_certificate.validity;
     let not_before = validity.not_before.to_date_time();
     let not_after = validity.not_after.to_date_time();
 
-    if gen_time < not_before || gen_time > not_after {
+    if gen_time < not_before || gen_time > not_after || (fractional && gen_time == not_after) {
         return Err(TspError::VerificationFailed(format!(
             "timestamp genTime {gen_time} is outside the TSA certificate validity \
              ({not_before} .. {not_after})"
@@ -1189,88 +1500,97 @@ pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
 /// }
 /// ```
 fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
-    let (tag, body) = der_utils::parse_tlv(der_bytes).map_err(|e| {
-        TspError::InvalidResponse(format!("TSTInfo: failed to parse SEQUENCE: {e}"))
-    })?;
-    if tag != 0x30 {
+    let (sequence, trailing) = parse_tst_field(der_bytes, 0x30, "TSTInfo")?;
+    if !trailing.is_empty() {
         return Err(TspError::InvalidResponse(
-            "TSTInfo: expected SEQUENCE".into(),
+            "TSTInfo: trailing data after SEQUENCE".into(),
         ));
     }
-
-    let mut pos = &body[..];
+    let mut pos = sequence.value();
 
     // version INTEGER
-    let (_vtag, _vbody, rest) = der_utils::parse_tlv_with_rest(pos)
-        .map_err(|e| TspError::InvalidResponse(format!("TSTInfo: failed to parse version: {e}")))?;
+    let (version, rest) = parse_tst_field(pos, 0x02, "TSTInfo version")?;
+    let version = version
+        .decode_as::<u64>()
+        .map_err(|e| TspError::InvalidResponse(format!("TSTInfo version: {e}")))?;
+    if version != 1 {
+        return Err(TspError::InvalidResponse(format!(
+            "TSTInfo: unsupported version {version} (expected 1)"
+        )));
+    }
     pos = rest;
 
     // policy TSAPolicyId (OID)
-    let (_ptag, pbody, rest) = der_utils::parse_tlv_with_rest(pos)
-        .map_err(|e| TspError::InvalidResponse(format!("TSTInfo: failed to parse policy: {e}")))?;
-    let policy_oid = ObjectIdentifier::from_der(&der_utils::encode_tlv(0x06, pbody))
-        .ok()
-        .map(|oid| oid.to_string());
+    let (policy, rest) = parse_tst_field(pos, 0x06, "TSTInfo policy")?;
+    let policy_oid = Some(
+        policy
+            .decode_as::<ObjectIdentifier>()
+            .map_err(|e| TspError::InvalidResponse(format!("TSTInfo policy: {e}")))?
+            .to_string(),
+    );
     pos = rest;
 
     // messageImprint SEQUENCE { hashAlgorithm, hashedMessage }
-    let (_mi_tag, mi_body, rest) = der_utils::parse_tlv_with_rest(pos).map_err(|e| {
-        TspError::InvalidResponse(format!("TSTInfo: failed to parse messageImprint: {e}"))
-    })?;
+    let (message_imprint, rest) = parse_tst_field(pos, 0x30, "TSTInfo messageImprint")?;
     pos = rest;
-
-    let (hash_algorithm, message_hash) = parse_message_imprint(mi_body)?;
+    let (hash_algorithm, message_hash) = parse_message_imprint(message_imprint.value())?;
 
     // serialNumber INTEGER
-    let (_sn_tag, sn_body, rest) = der_utils::parse_tlv_with_rest(pos).map_err(|e| {
-        TspError::InvalidResponse(format!("TSTInfo: failed to parse serialNumber: {e}"))
-    })?;
-    let serial_number = sn_body.to_vec();
+    let (serial, rest) = parse_tst_field(pos, 0x02, "TSTInfo serialNumber")?;
+    serial
+        .decode_as::<der::asn1::IntRef<'_>>()
+        .map_err(|e| TspError::InvalidResponse(format!("TSTInfo serialNumber: {e}")))?;
+    let serial_number = serial.value().to_vec();
     pos = rest;
 
     // genTime GeneralizedTime
-    let (_gt_tag, gt_body, rest) = der_utils::parse_tlv_with_rest(pos)
-        .map_err(|e| TspError::InvalidResponse(format!("TSTInfo: failed to parse genTime: {e}")))?;
-    let gen_time_der = gt_body.to_vec();
+    let (gen_time, rest) = parse_tst_field(pos, 0x18, "TSTInfo genTime")?;
+    let gen_time_der = gen_time.value().to_vec();
     pos = rest;
 
-    // Now parse optional fields: accuracy, ordering, nonce, tsa, extensions
+    // Optional fields have a fixed order and each can occur only once. In
+    // particular, a second nonce must not replace the value already parsed.
     let mut nonce = None;
-
+    let mut last_optional = 0;
     while !pos.is_empty() {
-        if let Ok((ftag, fbody, frest)) = der_utils::parse_tlv_with_rest(pos) {
-            match ftag {
-                // accuracy is SEQUENCE
-                0x30 => {
-                    // Skip accuracy
-                }
-                // ordering BOOLEAN
-                0x01 => {
-                    // Skip ordering
-                }
-                // nonce INTEGER
-                0x02 => {
-                    nonce =
-                        Some(der_utils::decode_integer_u64(fbody).map_err(|e| {
-                            TspError::InvalidResponse(format!("TSTInfo nonce: {e}"))
-                        })?);
-                }
-                // tsa [0] GeneralName
-                0xA0 => {
-                    // Skip TSA name
-                }
-                // extensions [1] IMPLICIT
-                0xA1 => {
-                    // Skip extensions
-                }
-                _ => {
-                    // Unknown, skip
-                }
+        let (rank, context) = match pos[0] {
+            0x30 => (1, "TSTInfo accuracy"),
+            0x01 => (2, "TSTInfo ordering"),
+            0x02 => (3, "TSTInfo nonce"),
+            0xA0 => (4, "TSTInfo tsa"),
+            0xA1 => (5, "TSTInfo extensions"),
+            tag => {
+                return Err(TspError::InvalidResponse(format!(
+                    "TSTInfo: unexpected optional field 0x{tag:02x}"
+                )))
             }
-            pos = frest;
-        } else {
-            break;
+        };
+        if rank <= last_optional {
+            return Err(TspError::InvalidResponse(format!(
+                "{context}: duplicate or out-of-order field"
+            )));
         }
+        let (field, rest) = parse_tst_field(pos, pos[0], context)?;
+        match rank {
+            1 => validate_tst_accuracy(field.value())?,
+            2 => {
+                field
+                    .decode_as::<bool>()
+                    .map_err(|e| TspError::InvalidResponse(format!("{context}: {e}")))?;
+            }
+            3 => {
+                nonce = Some(
+                    field
+                        .decode_as::<u64>()
+                        .map_err(|e| TspError::InvalidResponse(format!("{context}: {e}")))?,
+                );
+            }
+            4 => validate_tst_tsa_name(field.value())?,
+            5 => validate_tst_extensions(field.value())?,
+            _ => unreachable!("optional field ranks are fixed above"),
+        }
+        last_optional = rank;
+        pos = rest;
     }
 
     Ok(TstInfo {
@@ -1283,37 +1603,149 @@ fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
     })
 }
 
+/// Parse one field without copying its body. The DER decoder additionally
+/// checks canonical tag/length encoding; callers explicitly consume the rest.
+fn parse_tst_field<'a>(
+    input: &'a [u8],
+    expected_tag: u8,
+    context: &str,
+) -> Result<(der::asn1::AnyRef<'a>, &'a [u8]), TspError> {
+    let (tag, _, rest) = der_utils::parse_tlv_with_rest(input)
+        .map_err(|e| TspError::InvalidResponse(format!("{context}: {e}")))?;
+    if tag != expected_tag {
+        return Err(TspError::InvalidResponse(format!(
+            "{context}: expected tag 0x{expected_tag:02x}, got 0x{tag:02x}"
+        )));
+    }
+    let consumed = input.len() - rest.len();
+    let value = der::asn1::AnyRef::from_der(&input[..consumed])
+        .map_err(|e| TspError::InvalidResponse(format!("{context}: {e}")))?;
+    Ok((value, rest))
+}
+
+fn validate_tst_accuracy(mut pos: &[u8]) -> Result<(), TspError> {
+    let mut last_component = 0;
+    while !pos.is_empty() {
+        let rank = match pos[0] {
+            0x02 => 1, // seconds INTEGER OPTIONAL
+            0x80 => 2, // millis [0] INTEGER (1..999) OPTIONAL
+            0x81 => 3, // micros [1] INTEGER (1..999) OPTIONAL
+            tag => {
+                return Err(TspError::InvalidResponse(format!(
+                    "TSTInfo accuracy: unexpected field 0x{tag:02x}"
+                )))
+            }
+        };
+        if rank <= last_component {
+            return Err(TspError::InvalidResponse(
+                "TSTInfo accuracy: duplicate or out-of-order component".into(),
+            ));
+        }
+        let (field, rest) = parse_tst_field(pos, pos[0], "TSTInfo accuracy")?;
+        // The context-specific components are IMPLICIT INTEGERs.
+        let integer = der::asn1::AnyRef::new(der::Tag::Integer, field.value())
+            .map_err(|e| TspError::InvalidResponse(format!("TSTInfo accuracy: {e}")))?;
+        if rank == 1 {
+            integer
+                .decode_as::<der::asn1::UintRef<'_>>()
+                .map_err(|e| TspError::InvalidResponse(format!("TSTInfo accuracy seconds: {e}")))?;
+        } else {
+            let fraction = integer.decode_as::<u16>().map_err(|e| {
+                TspError::InvalidResponse(format!("TSTInfo accuracy millis/micros: {e}"))
+            })?;
+            if !(1..=999).contains(&fraction) {
+                return Err(TspError::InvalidResponse(
+                    "TSTInfo accuracy millis/micros must be in 1..=999".into(),
+                ));
+            }
+        }
+        last_component = rank;
+        pos = rest;
+    }
+    Ok(())
+}
+
+fn validate_tst_tsa_name(body: &[u8]) -> Result<(), TspError> {
+    let tag = *body
+        .first()
+        .ok_or_else(|| TspError::InvalidResponse("TSTInfo tsa: missing GeneralName".into()))?;
+    if !matches!(
+        tag,
+        0xA0 | 0x81 | 0x82 | 0xA3 | 0xA4 | 0xA5 | 0x86 | 0x87 | 0x88
+    ) {
+        return Err(TspError::InvalidResponse(format!(
+            "TSTInfo tsa: invalid GeneralName tag 0x{tag:02x}"
+        )));
+    }
+    let (_, rest) = parse_tst_field(body, tag, "TSTInfo tsa GeneralName")?;
+    if !rest.is_empty() {
+        return Err(TspError::InvalidResponse(
+            "TSTInfo tsa: trailing data after GeneralName".into(),
+        ));
+    }
+    // Keep every GeneralName choice, including x400Address, which x509-cert's
+    // typed decoder does not support. Identity matching is a separate check.
+    Ok(())
+}
+
+fn validate_tst_extensions(mut pos: &[u8]) -> Result<(), TspError> {
+    if pos.is_empty() {
+        return Err(TspError::InvalidResponse(
+            "TSTInfo extensions: empty Extensions".into(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    while !pos.is_empty() {
+        let (field, rest) = parse_tst_field(pos, 0x30, "TSTInfo extension")?;
+        let extension = field
+            .decode_as::<x509_cert::ext::Extension>()
+            .map_err(|e| TspError::InvalidResponse(format!("TSTInfo extension: {e}")))?;
+        if !seen.insert(extension.extn_id) {
+            return Err(TspError::InvalidResponse(format!(
+                "TSTInfo extension: duplicate OID {}",
+                extension.extn_id
+            )));
+        }
+        // No TSTInfo extension is currently interpreted by this verifier.
+        if extension.critical {
+            return Err(TspError::InvalidResponse(format!(
+                "TSTInfo extension: unsupported critical extension {}",
+                extension.extn_id
+            )));
+        }
+        pos = rest;
+    }
+    Ok(())
+}
+
 /// Parse a MessageImprint: { hashAlgorithm AlgorithmIdentifier, hashedMessage OCTET STRING }
 fn parse_message_imprint(body: &[u8]) -> Result<(DigestAlgorithm, Vec<u8>), TspError> {
-    // hashAlgorithm SEQUENCE
-    let (_alg_tag, alg_body, rest) = der_utils::parse_tlv_with_rest(body).map_err(|e| {
-        TspError::InvalidResponse(format!(
-            "messageImprint: failed to parse hashAlgorithm: {e}"
-        ))
-    })?;
-
-    // First element of AlgorithmIdentifier is the OID
-    let (_oid_tag, oid_body, _) = der_utils::parse_tlv_with_rest(alg_body).map_err(|e| {
-        TspError::InvalidResponse(format!(
-            "messageImprint: failed to parse algorithm OID: {e}"
-        ))
-    })?;
-
-    let alg_oid =
-        ObjectIdentifier::from_der(&der_utils::encode_tlv(0x06, oid_body)).map_err(|e| {
-            TspError::InvalidResponse(format!("messageImprint: invalid algorithm OID: {e}"))
-        })?;
-
-    let digest_alg = oid_to_digest_algorithm(&alg_oid)?;
-
-    // hashedMessage OCTET STRING
-    let (_hash_tag, hash_body, _) = der_utils::parse_tlv_with_rest(rest).map_err(|e| {
-        TspError::InvalidResponse(format!(
-            "messageImprint: failed to parse hashedMessage: {e}"
-        ))
-    })?;
-
-    Ok((digest_alg, hash_body.to_vec()))
+    let (algorithm, rest) = parse_tst_field(body, 0x30, "messageImprint hashAlgorithm")?;
+    let algorithm = algorithm
+        .decode_as::<spki::AlgorithmIdentifierRef<'_>>()
+        .map_err(|e| TspError::InvalidResponse(format!("messageImprint hashAlgorithm: {e}")))?;
+    let digest_alg = oid_to_digest_algorithm(&algorithm.oid)?;
+    // Preserve the absent/NULL convention used by interoperable SHA-2 TSAs.
+    if algorithm.parameters.is_some_and(|params| !params.is_null()) {
+        return Err(TspError::InvalidResponse(
+            "messageImprint hashAlgorithm parameters must be absent or NULL".into(),
+        ));
+    }
+    let (hash, trailing) = parse_tst_field(rest, 0x04, "messageImprint hashedMessage")?;
+    if !trailing.is_empty() {
+        return Err(TspError::InvalidResponse(
+            "messageImprint: trailing data after hashedMessage".into(),
+        ));
+    }
+    if hash.value().len() != digest_alg.output_size() {
+        return Err(TspError::InvalidResponse(format!(
+            "messageImprint: {} hash must contain {} bytes, got {}",
+            digest_alg.name(),
+            digest_alg.output_size(),
+            hash.value().len()
+        )));
+    }
+    Ok((digest_alg, hash.value().to_vec()))
 }
 
 /// Map an OID to our DigestAlgorithm enum.
@@ -1350,6 +1782,232 @@ pub fn generate_nonce() -> riptering::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_tst_info_fields() -> Vec<Vec<u8>> {
+        let algorithm = digest_algorithm_identifier(DigestAlgorithm::Sha256)
+            .to_der()
+            .unwrap();
+        let hash = der_utils::encode_tlv(0x04, &[0xAA; 32]);
+        vec![
+            der_utils::encode_integer_u64(1),
+            ObjectIdentifier::new_unwrap("1.2.3.4").to_der().unwrap(),
+            der_utils::encode_sequence_from_parts(&[&algorithm, &hash]),
+            der_utils::encode_integer_u64(42),
+            der_utils::encode_tlv(0x18, b"20260303120000Z"),
+        ]
+    }
+
+    fn synthetic_tst_info(fields: &[Vec<u8>]) -> Vec<u8> {
+        der_utils::encode_sequence_raw(&fields.concat())
+    }
+
+    #[test]
+    fn test_tsa_eku_requires_one_exclusive_fully_parsed_timestamp_purpose() {
+        let oid = ID_KP_TIME_STAMPING.to_der().unwrap();
+        let valid = der_utils::encode_sequence_raw(&oid);
+        let extension = x509_cert::ext::Extension {
+            extn_id: ID_CE_EXT_KEY_USAGE,
+            critical: true,
+            extn_value: OctetString::new(valid.clone()).unwrap(),
+        };
+        let mut cert = intermediate_cert();
+        cert.tbs_certificate.extensions = Some(vec![extension.clone()]);
+        assert!(require_timestamping_eku(&cert).is_ok());
+        let other_purpose = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1")
+            .to_der()
+            .unwrap();
+        for invalid in [
+            der_utils::encode_sequence_from_parts(&[&oid, &other_purpose]),
+            der_utils::encode_sequence_from_parts(&[&oid, &oid]),
+            der_utils::encode_sequence_raw(&[]),
+            der_utils::encode_sequence_from_parts(&[&oid, &[0x06, 0x02, 0x2A]]),
+            [valid, vec![0x05, 0x00]].concat(),
+        ] {
+            cert.tbs_certificate.extensions = Some(vec![x509_cert::ext::Extension {
+                extn_value: OctetString::new(invalid).unwrap(),
+                ..extension.clone()
+            }]);
+            assert!(require_timestamping_eku(&cert).is_err());
+        }
+        cert.tbs_certificate.extensions = Some(vec![extension.clone(), extension]);
+        assert!(matches!(
+            require_timestamping_eku(&cert),
+            Err(TspError::VerificationFailed(message)) if message.contains("duplicate")
+        ));
+    }
+
+    #[test]
+    fn test_tsa_basic_constraints_rejects_duplicate_extensions() {
+        let non_ca = x509_cert::ext::Extension {
+            extn_id: ID_CE_BASIC_CONSTRAINTS,
+            critical: true,
+            extn_value: OctetString::new([0x30, 0x00]).unwrap(),
+        };
+        let mut cert = intermediate_cert();
+        cert.tbs_certificate.extensions = Some(vec![non_ca.clone()]);
+        assert!(require_not_ca(&cert).is_ok());
+        cert.tbs_certificate.extensions = Some(vec![non_ca.clone(), non_ca]);
+        assert!(matches!(
+            require_not_ca(&cert),
+            Err(TspError::VerificationFailed(message)) if message.contains("duplicate")
+        ));
+    }
+
+    #[test]
+    fn test_tst_info_requires_correct_required_field_tags_and_version() {
+        let fields = synthetic_tst_info_fields();
+        assert!(parse_tst_info_body(&synthetic_tst_info(&fields)).is_ok());
+        for index in 0..fields.len() {
+            let mut wrong_tag = fields.clone();
+            wrong_tag[index][0] = 0x04;
+            assert!(
+                parse_tst_info_body(&synthetic_tst_info(&wrong_tag)).is_err(),
+                "required field {index} must retain its ASN.1 type"
+            );
+        }
+        for version in [vec![0x02, 0x01, 0x02], vec![0x02, 0x02, 0x00, 0x01]] {
+            let mut invalid = fields.clone();
+            invalid[0] = version;
+            assert!(parse_tst_info_body(&synthetic_tst_info(&invalid)).is_err());
+        }
+        let mut invalid = fields;
+        invalid[1] = vec![0x06, 0x01, 0x80];
+        assert!(parse_tst_info_body(&synthetic_tst_info(&invalid)).is_err());
+    }
+
+    #[test]
+    fn test_tst_info_rejects_trailing_malformed_duplicate_and_unordered_fields() {
+        let fields = synthetic_tst_info_fields();
+        let mut trailing = synthetic_tst_info(&fields);
+        trailing.extend_from_slice(&[0x05, 0x00]);
+        assert!(parse_tst_info_body(&trailing).is_err());
+        let nonce = der_utils::encode_integer_u64(7);
+        let optional_cases = [
+            vec![vec![0x02, 0x02, 0x01]], // truncated nonce
+            vec![nonce.clone(), nonce.clone()],
+            vec![nonce, der_utils::encode_boolean(true)],
+            vec![vec![0x05, 0x00]],       // unknown optional field
+            vec![vec![0x01, 0x01, 0x01]], // non-DER BOOLEAN
+            vec![vec![0xA0, 0x00]],       // empty TSA GeneralName wrapper
+            vec![vec![0xA1, 0x00]],       // empty Extensions
+        ];
+        for optional in optional_cases {
+            let mut invalid = fields.clone();
+            invalid.extend(optional);
+            assert!(parse_tst_info_body(&synthetic_tst_info(&invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn test_tst_info_accepts_well_formed_optional_fields() {
+        let mut fields = synthetic_tst_info_fields();
+        let seconds = der_utils::encode_integer_u64(0);
+        let millis = der_utils::encode_tlv(0x80, &[1]);
+        let micros = der_utils::encode_tlv(0x81, &[0x03, 0xE7]); // 999
+        fields.push(der_utils::encode_sequence_from_parts(&[
+            &seconds, &millis, &micros,
+        ]));
+        fields.push(der_utils::encode_boolean(true));
+        fields.push(der_utils::encode_integer_u64(u64::MAX));
+        fields.push(der_utils::encode_tlv(
+            0xA0,
+            &der_utils::encode_tlv(0x82, b"tsa.example"),
+        ));
+        let extension = x509_cert::ext::Extension {
+            extn_id: ObjectIdentifier::new_unwrap("1.2.3.5"),
+            critical: false,
+            extn_value: OctetString::new([0x05, 0x00]).unwrap(),
+        };
+        fields.push(der_utils::encode_tlv(0xA1, &extension.to_der().unwrap()));
+        let info = parse_tst_info_body(&synthetic_tst_info(&fields)).unwrap();
+        assert_eq!(info.nonce, Some(u64::MAX));
+        assert_eq!(info.policy_oid.as_deref(), Some("1.2.3.4"));
+        // Preserve the GeneralName choice omitted by x509-cert's typed decoder.
+        fields[8] = der_utils::encode_tlv(0xA0, &[0xA3, 0x02, 0x30, 0x00]);
+        assert!(parse_tst_info_body(&synthetic_tst_info(&fields)).is_ok());
+    }
+
+    #[test]
+    fn test_tst_info_accuracy_requires_valid_order_and_fraction_bounds() {
+        for body in [
+            vec![0x80, 0x01, 0x00],                   // zero millis
+            vec![0x81, 0x02, 0x03, 0xE8],             // 1000 micros
+            vec![0x80, 0x01, 0x01, 0x80, 0x01, 0x02], // duplicate millis
+            vec![0x81, 0x01, 0x01, 0x80, 0x01, 0x01], // reversed order
+            vec![0x02, 0x01, 0xFF],                   // negative seconds
+            vec![0x80, 0x02, 0x00],                   // truncated millis
+        ] {
+            let mut fields = synthetic_tst_info_fields();
+            fields.push(der_utils::encode_tlv(0x30, &body));
+            assert!(parse_tst_info_body(&synthetic_tst_info(&fields)).is_err());
+        }
+    }
+
+    #[test]
+    fn test_tst_info_extensions_rejects_duplicate_and_unrecognized_critical_oids() {
+        let extension = x509_cert::ext::Extension {
+            extn_id: ObjectIdentifier::new_unwrap("1.2.3.5"),
+            critical: false,
+            extn_value: OctetString::new([0x05, 0x00]).unwrap(),
+        };
+        let encoded = extension.to_der().unwrap();
+        assert!(validate_tst_extensions(&encoded).is_ok());
+        assert!(matches!(
+            validate_tst_extensions(&[encoded.clone(), encoded].concat()),
+            Err(TspError::InvalidResponse(message)) if message.contains("duplicate")
+        ));
+        let critical = x509_cert::ext::Extension {
+            critical: true,
+            ..extension
+        };
+        let mut fields = synthetic_tst_info_fields();
+        fields.push(der_utils::encode_tlv(0xA1, &critical.to_der().unwrap()));
+        assert!(matches!(
+            parse_tst_info_body(&synthetic_tst_info(&fields)),
+            Err(TspError::InvalidResponse(message)) if message.contains("critical")
+        ));
+    }
+
+    #[test]
+    fn test_message_imprint_validates_types_parameters_hash_size_and_consumption() {
+        let algorithm = digest_algorithm_identifier(DigestAlgorithm::Sha256)
+            .to_der()
+            .unwrap();
+        let hash = der_utils::encode_tlv(0x04, &[0xAA; 32]);
+        let body = [algorithm.clone(), hash.clone()].concat();
+        assert!(parse_message_imprint(&body).is_ok());
+        let mut wrong_algorithm_tag = algorithm.clone();
+        wrong_algorithm_tag[0] = 0x04;
+        let mut wrong_hash_tag = hash.clone();
+        wrong_hash_tag[0] = 0x02;
+        let mut oid = DigestAlgorithm::Sha256.oid().to_der().unwrap();
+        oid[0] = 0x04;
+        let wrong_oid_tag = der_utils::encode_sequence_raw(&oid);
+        let parameters = AlgorithmIdentifierOwned {
+            oid: DigestAlgorithm::Sha256.oid(),
+            parameters: Some(der::Any::from_der(&[0x02, 0x01, 0x01]).unwrap()),
+        }
+        .to_der()
+        .unwrap();
+        for invalid in [
+            [wrong_algorithm_tag, hash.clone()].concat(),
+            [algorithm.clone(), wrong_hash_tag].concat(),
+            [wrong_oid_tag, hash.clone()].concat(),
+            [parameters, hash.clone()].concat(),
+            [algorithm.clone(), der_utils::encode_tlv(0x04, &[0xAA; 31])].concat(),
+            [body, vec![0x05, 0x00]].concat(),
+        ] {
+            assert!(parse_message_imprint(&invalid).is_err());
+        }
+        // Both common AlgorithmIdentifier parameter conventions stay accepted.
+        let with_null = AlgorithmIdentifierOwned {
+            oid: DigestAlgorithm::Sha256.oid(),
+            parameters: Some(der::Any::null()),
+        }
+        .to_der()
+        .unwrap();
+        assert!(parse_message_imprint(&[with_null, hash].concat()).is_ok());
+    }
 
     #[test]
     fn test_build_timestamp_request_basic() {
@@ -1422,6 +2080,72 @@ mod tests {
         let resp = parse_timestamp_response(&resp_der).unwrap();
         assert_eq!(resp.status, PkiStatus::Rejection);
         assert!(resp.token_der.is_none());
+    }
+
+    #[test]
+    fn test_parse_timestamp_response_accepts_status_text_and_failure_info() {
+        let text = der_utils::encode_sequence_from_parts(&[
+            &der_utils::encode_tlv(0x0C, b"unsupported algorithm"),
+            &der_utils::encode_tlv(0x0C, "algorithm not supported: 算法".as_bytes()),
+        ]);
+        // badAlg is bit 0: seven unused bits in the final octet.
+        let failure = der_utils::encode_tlv(0x03, &[7, 0x80]);
+        let status = der_utils::encode_sequence_from_parts(&[
+            &der_utils::encode_integer_u64(2),
+            &text,
+            &failure,
+        ]);
+        let response = der_utils::encode_sequence_raw(&status);
+        let parsed = parse_timestamp_response(&response).unwrap();
+        assert_eq!(
+            parsed.status_string.as_deref(),
+            Some("unsupported algorithm")
+        );
+        assert_eq!(parsed.failure_info.as_deref(), Some(&[7, 0x80][..]));
+        // failureInfo is also permitted without the optional statusString.
+        let status =
+            der_utils::encode_sequence_from_parts(&[&der_utils::encode_integer_u64(2), &failure]);
+        assert!(parse_timestamp_response(&der_utils::encode_sequence_raw(&status)).is_ok());
+    }
+
+    #[test]
+    fn test_parse_timestamp_response_rejects_outer_trailing_and_ambiguous_status_fields() {
+        let text = der_utils::encode_sequence_raw(&der_utils::encode_tlv(0x0C, b"rejected"));
+        let failure = der_utils::encode_tlv(0x03, &[7, 0x80]);
+        for optional in [
+            vec![text.clone(), text.clone()],
+            vec![failure.clone(), failure.clone()],
+            vec![failure, text],
+            vec![vec![0x05, 0x00]],
+        ] {
+            let mut status_fields = vec![der_utils::encode_integer_u64(2)];
+            status_fields.extend(optional);
+            let status = der_utils::encode_sequence_raw(&status_fields.concat());
+            assert!(parse_timestamp_response(&der_utils::encode_sequence_raw(&status)).is_err());
+        }
+        let status = der_utils::encode_sequence_raw(&der_utils::encode_integer_u64(2));
+        let mut response = der_utils::encode_sequence_raw(&status);
+        response.extend_from_slice(&[0x05, 0x00]);
+        assert!(matches!(
+            parse_timestamp_response(&response),
+            Err(TspError::InvalidResponse(message)) if message.contains("trailing")
+        ));
+    }
+
+    #[test]
+    fn test_parse_timestamp_response_rejects_malformed_failure_info() {
+        for failure_body in [
+            vec![],
+            vec![8],       // unused-bits count exceeds seven
+            vec![1],       // unused bits without a data octet
+            vec![7, 0x81], // nonzero padding bits
+        ] {
+            let status = der_utils::encode_sequence_from_parts(&[
+                &der_utils::encode_integer_u64(2),
+                &der_utils::encode_tlv(0x03, &failure_body),
+            ]);
+            assert!(parse_timestamp_response(&der_utils::encode_sequence_raw(&status)).is_err());
+        }
     }
 
     #[test]
@@ -1814,8 +2538,15 @@ mod tests {
             oid: ID_MESSAGE_DIGEST_ATTR,
             values: SetOfVec::try_from(vec![md_value]).unwrap(),
         };
+        let cert_hash = Sha256::digest(signer_cert.to_der().unwrap());
+        let ess_id = der_utils::encode_sequence_raw(&der_utils::encode_tlv(0x04, &cert_hash));
+        let ess = der_utils::encode_sequence_raw(&der_utils::encode_sequence_raw(&ess_id));
+        let ess_attr = Attribute {
+            oid: ID_SIGNING_CERTIFICATE_V2,
+            values: SetOfVec::try_from(vec![Any::from_der(&ess).unwrap()]).unwrap(),
+        };
         let signed_attrs: x509_cert::attr::Attributes =
-            SetOfVec::try_from(vec![ct_attr, md_attr]).unwrap();
+            SetOfVec::try_from(vec![ct_attr, md_attr, ess_attr]).unwrap();
 
         // Sign the DER of the SET OF signed attributes (RFC 5652 §5.4).
         let signed_attrs_der = signed_attrs.to_der().unwrap();
@@ -1878,6 +2609,403 @@ mod tests {
             content: Any::encode_from(&signed_data).unwrap(),
         };
         content_info.to_der().unwrap()
+    }
+
+    fn ess_attribute(
+        cert: &Certificate,
+        v2: bool,
+        algorithm: Option<DigestAlgorithm>,
+        issuer_serial: bool,
+    ) -> Attribute {
+        let der = cert.to_der().unwrap();
+        let digest = if v2 {
+            algorithm.unwrap_or(DigestAlgorithm::Sha256).into()
+        } else {
+            riptering::HashAlgorithm::Sha1
+        };
+        let hash = riptering::digest::digest(digest, &der).unwrap();
+        let mut id = Vec::new();
+        if let Some(algorithm) = algorithm {
+            id.extend_from_slice(&digest_algorithm_identifier(algorithm).to_der().unwrap());
+        }
+        id.extend_from_slice(&der_utils::encode_tlv(0x04, &hash));
+        if issuer_serial {
+            let issuer =
+                der_utils::encode_tlv(0xA4, &cert.tbs_certificate.issuer.to_der().unwrap());
+            let names = der_utils::encode_sequence_raw(&issuer);
+            let serial = cert.tbs_certificate.serial_number.to_der().unwrap();
+            id.extend_from_slice(&der_utils::encode_sequence_from_parts(&[&names, &serial]));
+        }
+        let value = der_utils::encode_sequence_raw(&der_utils::encode_sequence_raw(
+            &der_utils::encode_sequence_raw(&id),
+        ));
+        Attribute {
+            oid: if v2 {
+                ID_SIGNING_CERTIFICATE_V2
+            } else {
+                ID_SIGNING_CERTIFICATE
+            },
+            values: SetOfVec::try_from(vec![Any::from_der(&value).unwrap()]).unwrap(),
+        }
+    }
+
+    /// Re-sign a small local token fixture after changing authenticated fields.
+    /// These tests verify rejection/acceptance at the public verifier boundary.
+    fn rewrite_signed_fixture(
+        token: &[u8],
+        attributes: Option<Vec<Attribute>>,
+        tsa: Option<&[u8]>,
+    ) -> Vec<u8> {
+        use rsa::signature::{SignatureEncoding, Signer};
+        use sha2::{Digest, Sha256};
+        let mut ci = ContentInfo::from_der(token).unwrap();
+        let mut sd: cms::signed_data::SignedData = ci.content.decode_as().unwrap();
+        let mut si = sd.signer_infos.0.iter().next().unwrap().clone();
+        let mut attrs: Vec<_> = si.signed_attrs.as_ref().unwrap().iter().cloned().collect();
+        if let Some(attributes) = attributes {
+            attrs.retain(|a| a.oid != ID_SIGNING_CERTIFICATE && a.oid != ID_SIGNING_CERTIFICATE_V2);
+            attrs.extend(attributes);
+        }
+        if let Some(tsa) = tsa {
+            let content = sd.encap_content_info.econtent.as_ref().unwrap().value();
+            let (sequence, _) = parse_tst_field(content, 0x30, "test TSTInfo").unwrap();
+            let body = [sequence.value(), &der_utils::encode_tlv(0xA0, tsa)].concat();
+            let content = der_utils::encode_sequence_raw(&body);
+            let digest = Sha256::digest(&content).to_vec();
+            attrs.retain(|a| a.oid != ID_MESSAGE_DIGEST_ATTR);
+            attrs.push(Attribute {
+                oid: ID_MESSAGE_DIGEST_ATTR,
+                values: SetOfVec::try_from(vec![Any::new(Tag::OctetString, digest).unwrap()])
+                    .unwrap(),
+            });
+            sd.encap_content_info.econtent = Some(Any::new(Tag::OctetString, content).unwrap());
+        }
+        si.signed_attrs = Some(SetOfVec::try_from(attrs).unwrap());
+        let signing = rsa::pkcs1v15::SigningKey::<Sha256>::new(tsa_key());
+        let signature: rsa::pkcs1v15::Signature =
+            signing.sign(&si.signed_attrs.as_ref().unwrap().to_der().unwrap());
+        si.signature = OctetString::new(signature.to_vec()).unwrap();
+        sd.signer_infos = SignerInfos::from(SetOfVec::try_from(vec![si]).unwrap());
+        ci.content = Any::encode_from(&sd).unwrap();
+        ci.to_der().unwrap()
+    }
+
+    #[test]
+    fn test_ess_v1_v2_bind_hash_issuer_and_serial_and_require_signed_attribute() {
+        let cert = tsa_cert();
+        let hash = [0x4A; 32];
+        let token = build_signed_token(&cert, &tsa_key(), &[], &hash, 7, false);
+        for attributes in [
+            vec![ess_attribute(&cert, false, None, true)],
+            vec![ess_attribute(&cert, true, None, false)],
+            vec![ess_attribute(
+                &cert,
+                true,
+                Some(DigestAlgorithm::Sha384),
+                true,
+            )],
+            vec![
+                ess_attribute(&cert, false, None, true),
+                ess_attribute(&cert, true, None, true),
+            ],
+        ] {
+            let fixture = rewrite_signed_fixture(&token, Some(attributes), None);
+            verify_timestamp_token(
+                &fixture,
+                &hash,
+                DigestAlgorithm::Sha256,
+                Some(7),
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        }
+        let mut other_serial = cert.clone();
+        other_serial.tbs_certificate.serial_number =
+            x509_cert::serial_number::SerialNumber::new(&[99]).unwrap();
+        let mut other_issuer = cert.clone();
+        other_issuer.tbs_certificate.issuer = "CN=Other Issuer".parse().unwrap();
+        for invalid in [
+            vec![],
+            vec![ess_attribute(&other_serial, true, None, true)],
+            vec![ess_attribute(&other_issuer, true, None, true)],
+            vec![
+                ess_attribute(&cert, false, None, false),
+                ess_attribute(&other_serial, true, None, false),
+            ],
+            vec![
+                ess_attribute(&cert, true, None, false),
+                ess_attribute(&other_serial, true, None, false),
+            ],
+        ] {
+            let fixture = rewrite_signed_fixture(&token, Some(invalid), None);
+            assert!(verify_timestamp_token(
+                &fixture,
+                &hash,
+                DigestAlgorithm::Sha256,
+                Some(7),
+                None,
+                None,
+                &[]
+            )
+            .is_err());
+        }
+        // Isolate issuer/serial matching independently of the certificate hash.
+        let value = ess_attribute(&cert, true, None, true);
+        let mut binding = parse_ess_binding(value.values.iter().next().unwrap(), true).unwrap();
+        binding.issuer_serial.as_mut().unwrap().1 = other_serial.tbs_certificate.serial_number;
+        assert!(!binding.matches(&cert).unwrap());
+        binding.issuer_serial.as_mut().unwrap().0 = other_issuer.tbs_certificate.issuer;
+        binding.issuer_serial.as_mut().unwrap().1 = cert.tbs_certificate.serial_number.clone();
+        assert!(!binding.matches(&cert).unwrap());
+    }
+
+    #[test]
+    fn test_ess_rejects_unsupported_restrictions_and_malformed_fields() {
+        let id = der_utils::encode_sequence_raw(&der_utils::encode_tlv(0x04, &[0x11; 32]));
+        let certs = der_utils::encode_sequence_raw(&id);
+        for value in [
+            der_utils::encode_sequence_raw(&der_utils::encode_sequence_raw(&[])),
+            der_utils::encode_sequence_raw(&der_utils::encode_sequence_from_parts(&[&id, &id])),
+            der_utils::encode_sequence_from_parts(&[&certs, &[0x30, 0x00]]),
+            der_utils::encode_sequence_raw(&der_utils::encode_sequence_raw(
+                &der_utils::encode_sequence_raw(&der_utils::encode_tlv(0x04, &[0x11; 31])),
+            )),
+        ] {
+            assert!(parse_ess_binding(&Any::from_der(&value).unwrap(), true).is_err());
+        }
+    }
+
+    #[test]
+    fn test_timestamp_key_usage_and_eku_must_both_permit_signing() {
+        let hash = [0x4E; 32];
+        let oid = ObjectIdentifier::new_unwrap("2.5.29.15");
+        for (value, allowed) in [
+            (vec![0x03, 0x02, 0x00, 0x80], true),
+            (vec![0x03, 0x02, 0x00, 0x40], true),
+            (vec![0x03, 0x02, 0x00, 0x20], false),
+            (vec![0x03, 0x02, 0x01, 0x81], false),
+            (vec![0x03, 0x02, 0x00, 0x00], false),
+            (vec![0x03, 0x02, 0x00, 0x80, 0x05, 0x00], false),
+        ] {
+            for critical in [true, false] {
+                let mut cert = tsa_cert();
+                cert.tbs_certificate
+                    .extensions
+                    .as_mut()
+                    .unwrap()
+                    .retain(|e| e.extn_id != oid);
+                cert.tbs_certificate
+                    .extensions
+                    .as_mut()
+                    .unwrap()
+                    .push(x509_cert::ext::Extension {
+                        extn_id: oid,
+                        critical,
+                        extn_value: OctetString::new(value.clone()).unwrap(),
+                    });
+                let token = build_signed_token(&cert, &tsa_key(), &[], &hash, 11, false);
+                assert_eq!(
+                    verify_timestamp_token(
+                        &token,
+                        &hash,
+                        DigestAlgorithm::Sha256,
+                        Some(11),
+                        None,
+                        None,
+                        &[]
+                    )
+                    .is_ok(),
+                    allowed
+                );
+                #[cfg(feature = "ltv")]
+                assert_eq!(
+                    crate::ltv::validate_extensions_for_role(
+                        &cert,
+                        crate::ltv::CertRole::TimestampSigner
+                    )
+                    .is_ok(),
+                    allowed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_ess_selects_exact_certificate_and_rejects_unsigned_binding() {
+        let cert = tsa_cert();
+        let hash = [0x4D; 32];
+        let token = build_signed_token(&cert, &tsa_key(), &[], &hash, 10, false);
+        let mut ci = ContentInfo::from_der(&token).unwrap();
+        let mut sd: cms::signed_data::SignedData = ci.content.decode_as().unwrap();
+        let mut substituted = cert.clone();
+        substituted.signature = der::asn1::BitString::from_bytes(&[0x11; 256]).unwrap();
+        sd.certificates = Some(CertificateSet::from(
+            SetOfVec::try_from(vec![CertificateChoices::Certificate(substituted)]).unwrap(),
+        ));
+        ci.content = Any::encode_from(&sd).unwrap();
+        let token = ci.to_der().unwrap();
+        assert!(verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            Some(10),
+            None,
+            None,
+            &[]
+        )
+        .is_err());
+        // The out-of-band original has identical TBS but distinct full DER.
+        verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            Some(10),
+            None,
+            None,
+            std::slice::from_ref(&cert),
+        )
+        .unwrap();
+        let mut si = sd.signer_infos.0.iter().next().unwrap().clone();
+        si.unsigned_attrs =
+            Some(SetOfVec::try_from(vec![ess_attribute(&cert, true, None, false)]).unwrap());
+        sd.signer_infos = SignerInfos::from(SetOfVec::try_from(vec![si]).unwrap());
+        ci.content = Any::encode_from(&sd).unwrap();
+        let err = verify_timestamp_token(
+            &ci.to_der().unwrap(),
+            &hash,
+            DigestAlgorithm::Sha256,
+            Some(10),
+            None,
+            None,
+            &[cert],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must be signed"));
+    }
+
+    #[test]
+    fn test_authenticated_tsa_must_match_signer_subject_or_san() {
+        let hash = [0x4B; 32];
+        let cert = tsa_cert();
+        let token = build_signed_token(&cert, &tsa_key(), &[], &hash, 8, false);
+        let subject = der_utils::encode_tlv(0xA4, &cert.tbs_certificate.subject.to_der().unwrap());
+        let valid = rewrite_signed_fixture(&token, None, Some(&subject));
+        verify_timestamp_token(
+            &valid,
+            &hash,
+            DigestAlgorithm::Sha256,
+            Some(8),
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        for name in [
+            der_utils::encode_tlv(0x82, b"other.example"),
+            vec![0xA3, 0x02, 0x30, 0x00],
+        ] {
+            let invalid = rewrite_signed_fixture(&token, None, Some(&name));
+            assert!(verify_timestamp_token(
+                &invalid,
+                &hash,
+                DigestAlgorithm::Sha256,
+                Some(8),
+                None,
+                None,
+                &[]
+            )
+            .is_err());
+        }
+        let mut cert = cert;
+        let dns = der_utils::encode_tlv(0x82, b"TSA.example");
+        cert.tbs_certificate
+            .extensions
+            .as_mut()
+            .unwrap()
+            .push(x509_cert::ext::Extension {
+                extn_id: ObjectIdentifier::new_unwrap("2.5.29.17"),
+                critical: false,
+                extn_value: OctetString::new(der_utils::encode_sequence_raw(&dns)).unwrap(),
+            });
+        let token = build_signed_token(&cert, &tsa_key(), &[], &hash, 8, false);
+        let valid = rewrite_signed_fixture(
+            &token,
+            None,
+            Some(&der_utils::encode_tlv(0x82, b"tsa.example")),
+        );
+        verify_timestamp_token(
+            &valid,
+            &hash,
+            DigestAlgorithm::Sha256,
+            Some(8),
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_fractional_gen_time_and_exact_validity_end_boundary() {
+        let cert = tsa_cert();
+        let hash = [0x4C; 32];
+        let seconds = gen_time_within();
+        let fraction = [&seconds[..14], b".123456789123Z"].concat();
+        let token = build_signed_token_gt(&cert, &tsa_key(), &[], &hash, 9, &fraction, true, false);
+        let parsed = verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            Some(9),
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(parsed.gen_time_der, fraction);
+        let end = cert.tbs_certificate.validity.not_after.to_date_time();
+        let end = format!(
+            "{:04}{:02}{:02}{:02}{:02}{:02}",
+            end.year(),
+            end.month(),
+            end.day(),
+            end.hour(),
+            end.minutes(),
+            end.seconds()
+        );
+        let token = build_signed_token_gt(
+            &cert,
+            &tsa_key(),
+            &[],
+            &hash,
+            9,
+            format!("{end}.1Z").as_bytes(),
+            true,
+            false,
+        );
+        assert!(verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            Some(9),
+            None,
+            None,
+            &[]
+        )
+        .is_err());
+        for invalid in [
+            b"20260303120000.10Z".as_slice(),
+            b"20260303120000,Z",
+            b"20260303120000.Z",
+            b"20260303120000.0Z",
+        ] {
+            let mut fields = synthetic_tst_info_fields();
+            fields[4] = der_utils::encode_tlv(0x18, invalid);
+            let info = parse_tst_info_body(&synthetic_tst_info(&fields)).unwrap();
+            assert!(gen_time_datetime(&info).is_err());
+        }
     }
 
     #[test]

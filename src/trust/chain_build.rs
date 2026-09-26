@@ -98,6 +98,11 @@ pub fn build_chain_from_pool_with_policy(
         let mut found = false;
         let mut matching_issuer_error = None;
         for candidate in pool {
+            // Compare parsed names before allocating a full DER encoding for
+            // the usually unrelated certificates in the pool.
+            if candidate.tbs_certificate.subject != current.tbs_certificate.issuer {
+                continue;
+            }
             let candidate_der = candidate
                 .to_der()
                 .map_err(|e| TrustError::CertificateParse(format!("DER encode failed: {e}")))?;
@@ -106,26 +111,18 @@ pub fn build_chain_from_pool_with_policy(
                 continue; // avoid cycles
             }
 
-            let candidate_subject_der = candidate
-                .tbs_certificate
-                .subject
-                .to_der()
-                .unwrap_or_default();
-
-            if candidate_subject_der == issuer_name_der {
-                // Verify the signature before accepting this link
-                match crate::crypto::verify::verify_certificate_signature_with_policy(
-                    &current, candidate, policy,
-                ) {
-                    Ok(()) => {
-                        visited.push(candidate_der);
-                        chain.push(candidate.clone());
-                        current = candidate.clone();
-                        found = true;
-                        break;
-                    }
-                    Err(error) => matching_issuer_error = Some(error),
+            // Verify the signature before accepting this link
+            match crate::crypto::verify::verify_certificate_signature_with_policy(
+                &current, candidate, policy,
+            ) {
+                Ok(()) => {
+                    visited.push(candidate_der);
+                    chain.push(candidate.clone());
+                    current = candidate.clone();
+                    found = true;
+                    break;
                 }
+                Err(error) => matching_issuer_error = Some(error),
             }
         }
 

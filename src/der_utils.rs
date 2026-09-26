@@ -23,10 +23,13 @@ pub fn parse_tlv_with_rest(data: &[u8]) -> Result<(u8, &[u8], &[u8]), String> {
     }
 
     let tag = data[0];
+    if tag & 0x1f == 0x1f {
+        return Err("high-tag-number form is not supported".into());
+    }
     let (len, header_len) = parse_der_length(&data[1..])?;
     let total_header = 1 + header_len;
 
-    if total_header + len > data.len() {
+    if len > data.len().saturating_sub(total_header) {
         return Err(format!(
             "TLV length exceeds data: header={total_header}, len={len}, available={}",
             data.len()
@@ -59,9 +62,15 @@ pub fn parse_der_length(data: &[u8]) -> Result<(usize, usize), String> {
         if 1 + num_bytes > data.len() {
             return Err("insufficient data for length".into());
         }
+        if data[1] == 0 {
+            return Err("non-canonical DER length: leading zero".into());
+        }
         let mut len: usize = 0;
         for i in 0..num_bytes {
             len = (len << 8) | (data[1 + i] as usize);
+        }
+        if len < 128 {
+            return Err("non-canonical DER length: unnecessary long form".into());
         }
         Ok((len, 1 + num_bytes))
     }
@@ -439,6 +448,15 @@ mod tests {
             assert_eq!(parsed_len, len, "length roundtrip failed for {len}");
             assert_eq!(consumed, buf.len());
         }
+    }
+
+    #[test]
+    fn noncanonical_lengths_and_unsupported_tags_are_rejected() {
+        assert!(parse_der_length(&[0x81, 0x7f]).is_err());
+        assert!(parse_der_length(&[0x82, 0, 0x80]).is_err());
+        assert!(parse_tlv_with_rest(&[0x1f, 0]).is_err());
+        assert!(parse_tlv_with_rest(&[0x04, 0x84, 0xff, 0xff, 0xff, 0xff]).is_err());
+        assert_eq!(parse_der_length(&[0x81, 0x80]).unwrap(), (128, 2));
     }
 
     #[test]

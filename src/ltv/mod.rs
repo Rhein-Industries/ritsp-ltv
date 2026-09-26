@@ -32,13 +32,18 @@ pub use chain::ChainBuilder;
 pub use crl::CrlClient;
 pub use ocsp::{
     build_ocsp_request_with_nonce, check_revocation as ocsp_check_revocation,
-    check_revocation_detailed as ocsp_check_revocation_detailed, extract_aia_urls,
-    has_ocsp_nocheck_extension, parse_ocsp_response, AiaAccessMethod, CertStatus, OcspCheckOutcome,
-    OcspClient, OcspFreshness, ParsedBasicOcspResponse, ResponderId, SingleResponse,
+    check_revocation_detailed as ocsp_check_revocation_detailed,
+    check_revocation_detailed_with_issuer_path, check_revocation_detailed_with_nonce_policy,
+    extract_aia_urls, has_ocsp_nocheck_extension, parse_ocsp_response, AiaAccessMethod, CertStatus,
+    OcspCheckOutcome, OcspClient, OcspFreshness, ParsedBasicOcspResponse, ResponderId,
+    SingleResponse,
 };
 #[cfg(feature = "blocking")]
 pub use revocation::check_certificate_revocation_blocking;
-pub use revocation::{check_certificate_revocation, RevocationConfig};
+pub use revocation::{
+    check_certificate_revocation, check_certificate_revocation_with_ocsp_context,
+    OcspValidationContext, RevocationConfig,
+};
 pub use status::{resolve_priority, RevocationReason, RevocationSource, ValidationStatus};
 pub use x509_ext::{
     check_basic_constraints, check_extended_key_usage, check_key_usage, has_extension,

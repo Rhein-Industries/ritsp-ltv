@@ -1,26 +1,13 @@
 # ritsp-ltv
 
-> **Fork notice.** ritsp-ltv is Rhein Industries' actively maintained fork of
-> [tsp-ltv](https://github.com/kushaldas/tsp-ltv) by Kushal Das. It starts
-> from tsp-ltv 0.4.0 and keeps tsp-ltv's BSD-2-Clause license and copyright
-> notice. ritsp-ltv is **not affiliated with or endorsed by** the upstream
-> author: please report problems with ritsp-ltv to Rhein Industries, not to
-> the tsp-ltv project.
->
-> - Bugs and feature requests:
->   <https://github.com/Rhein-Industries/ritsp-ltv/issues>
-> - Security problems: report them privately as described in
->   [SECURITY.md](SECURITY.md); do not open a public issue.
-
 Shared timestamping (RFC 3161) and long-term validation infrastructure for
 Advanced Electronic Signature (AdES) formats. Provides OCSP, CRL, trust
 stores, and certificate chain building used by
 [underskrift](https://github.com/kushaldas/underskrift) (PAdES/CAdES),
 bergshamra (XAdES), and jades (JAdES).
 
-Version 0.5 requires Rust 1.88 and delegates all cryptographic operations and
-TLS provider configuration to `riptering` 0.6, Rhein Industries' maintained fork
-of `kryptering`.
+Version 0.6 requires Rust 1.88 and delegates all cryptographic operations and
+TLS provider configuration to `riptering` 0.7.
 
 ## Features
 
@@ -52,11 +39,11 @@ of `kryptering`.
 This crate is **format-agnostic** — it does not know about PDF, XML, or JSON.
 Each AdES crate builds its own format-specific embedding (DSS dictionaries for
 PAdES, XAdES qualifying properties, JAdES `etsiU` headers) on top of these
-shared clients. Consumer crates typically re-export tsp-ltv modules as thin
-facades (e.g. `pub use tsp_ltv::trust::*;`).
+shared clients. Consumer crates can re-export ritsp-ltv modules as thin
+facades (e.g. `pub use ritsp_ltv::trust::*;`).
 
 ```
-tsp-ltv (this crate)
+ritsp-ltv (this crate)
    ├── tsp     — RFC 3161 TSA client + ASN.1 parsing
    ├── ltv     — OCSP, CRL, chain building, revocation
    ├── trust   — trust stores, chain building from cert pools, chain validation
@@ -75,7 +62,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tsp-ltv = "0.4"
+ritsp-ltv = "0.6"
 ```
 
 Defaults are `tsp`, `ltv`, `blocking`, `rustcrypto`, `tls-ring`, and
@@ -83,7 +70,7 @@ Defaults are `tsp`, `ltv`, `blocking`, `rustcrypto`, `tls-ring`, and
 
 ```toml
 [dependencies]
-tsp-ltv = { version = "0.4", default-features = false, features = ["tsp", "rustcrypto", "tls-ring"] }
+ritsp-ltv = { version = "0.6", default-features = false, features = ["tsp", "rustcrypto", "tls-ring"] }
 ```
 
 For crates that only need trust store management and certificate verification
@@ -91,7 +78,7 @@ For crates that only need trust store management and certificate verification
 
 ```toml
 [dependencies]
-tsp-ltv = { version = "0.4", default-features = false, features = ["rustcrypto"] }
+ritsp-ltv = { version = "0.6", default-features = false, features = ["rustcrypto"] }
 ```
 
 This gives you access to the `trust` and `crypto` modules without pulling in
@@ -100,7 +87,7 @@ OCSP, CRL, or TSP client dependencies.
 ### Request a timestamp
 
 ```rust
-use tsp_ltv::tsp::{TsaClient, TsaClientPool};
+use ritsp_ltv::tsp::{TsaClient, TsaClientPool};
 
 let client = TsaClient::new("http://timestamp.digicert.com")?;
 let hash = vec![0u8; 32]; // SHA-256 hash of signature value
@@ -117,7 +104,7 @@ let token = pool.timestamp(&hash).await?;
 ### Check certificate revocation
 
 ```rust
-use tsp_ltv::ltv::{OcspClient, CrlClient, RevocationConfig, check_certificate_revocation};
+use ritsp_ltv::ltv::{OcspClient, CrlClient, RevocationConfig, check_certificate_revocation};
 
 let ocsp = OcspClient::new()?;
 let crl = CrlClient::new()?;
@@ -131,7 +118,7 @@ let status = check_certificate_revocation(
 ### Load trust anchors
 
 ```rust
-use tsp_ltv::trust::{TrustStore, TrustStoreSet};
+use ritsp_ltv::trust::{TrustStore, TrustStoreSet};
 
 let sig_store = TrustStore::from_pem_file("ca-certs.pem")?;
 let tsa_store = TrustStore::from_pem_directory("/etc/ssl/certs")?;
@@ -144,7 +131,7 @@ let stores = TrustStoreSet::new()
 ### Build and verify a certificate chain
 
 ```rust
-use tsp_ltv::trust::{TrustStore, build_chain_from_pool, trust_anchor_subjects};
+use ritsp_ltv::trust::{TrustStore, build_chain_from_pool, trust_anchor_subjects};
 
 // Load trust anchors
 let trust_store = TrustStore::from_pem_file("ca-certs.pem")?;
@@ -183,10 +170,34 @@ an `AttestedHttpClient`; raw `reqwest::Client` injection is unavailable in
 FIPS builds. Non-FIPS callers that deliberately accept the risk must use the
 explicitly named `unverified_http_client` escape hatch.
 
+Hardened clients validate DNS answers at connection time, including redirect
+hostnames, and disable environment proxies. They default to a 10-second
+connection timeout and a 30-second request timeout. TSA and OCSP downloads have
+configurable 10 MiB limits; the CRL cache retains at most 64 entries and 32 MiB
+of DER. Reuse or clone client instances to retain their connection pools and
+caches. See [local performance checks](docs/local-performance.md).
+
+Delegated OCSP responses require a complete issuer path and trust store, even
+when `nocheck` is present. Use `check_revocation_detailed_with_issuer_path`, or
+the async `check_certificate_revocation_with_ocsp_context` orchestrator; the
+issuer-only helpers reject delegated responders. Strict nonce echo checking
+is opt-in. Timestamp verification requires an ESS certificate binding and
+checks any TSTInfo TSA name. Malformed DER, duplicate extensions, and
+unsupported critical CRL or timestamp extensions are rejected. Supported
+profiles and migration details are in [validation profiles](docs/validation-profiles.md).
+
 In FIPS builds, call `initialize_backend()` before digesting, validation, or
 HTTPS client creation. Enabling the feature does not itself certify the
 application or deployment.
 
+## Contributing and security
+
+Report bugs and feature requests in [GitHub Issues](https://github.com/Rhein-Industries/ritsp-ltv/issues).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development checks and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
 ## License
 
-BSD-2-Clause
+BSD-2-Clause, see [LICENSE](LICENSE).[^history]
+
+[^history]: ritsp-ltv started from [tsp-ltv](https://github.com/kushaldas/tsp-ltv) 0.4.0 by Kushal Das. The original copyright and license notices are retained in LICENSE.
