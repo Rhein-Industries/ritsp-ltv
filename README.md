@@ -1,17 +1,5 @@
 # ritsp-ltv
 
-> **Fork notice.** ritsp-ltv is Rhein Industries' actively maintained fork of
-> [tsp-ltv](https://github.com/kushaldas/tsp-ltv) by Kushal Das. It starts
-> from tsp-ltv 0.4.0 and keeps tsp-ltv's BSD-2-Clause license and copyright
-> notice. ritsp-ltv is **not affiliated with or endorsed by** the upstream
-> author: please report problems with ritsp-ltv to Rhein Industries, not to
-> the tsp-ltv project.
->
-> - Bugs and feature requests:
->   <https://github.com/Rhein-Industries/ritsp-ltv/issues>
-> - Security problems: report them privately as described in
->   [SECURITY.md](SECURITY.md); do not open a public issue.
-
 Shared timestamping (RFC 3161) and long-term validation infrastructure for
 Advanced Electronic Signature (AdES) formats. Provides OCSP, CRL, trust
 stores, and certificate chain building used by
@@ -19,8 +7,7 @@ stores, and certificate chain building used by
 bergshamra (XAdES), and jades (JAdES).
 
 Version 0.6 requires Rust 1.88 and delegates all cryptographic operations and
-TLS provider configuration to `riptering` 0.7, Rhein Industries' maintained fork
-of `kryptering`.
+TLS provider configuration to `riptering` 0.7.
 
 ## Features
 
@@ -203,6 +190,14 @@ In FIPS builds, call `initialize_backend()` before digesting, validation, or
 HTTPS client creation. Enabling the feature does not itself certify the
 application or deployment.
 
+## Contributing and security
+
+Report bugs and feature requests in [GitHub Issues](https://github.com/Rhein-Industries/ritsp-ltv/issues).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development checks and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
 ## License
 
-BSD-2-Clause
+BSD-2-Clause, see [LICENSE](LICENSE).[^history]
+
+[^history]: ritsp-ltv started from [tsp-ltv](https://github.com/kushaldas/tsp-ltv) 0.4.0 by Kushal Das. The original copyright and license notices are retained in LICENSE.
